@@ -105,15 +105,19 @@ def format_command(template: str, values: dict[str, Any]) -> list[str]:
 def wait_for_sglang(base_url: str, timeout_s: float) -> None:
     deadline = time.monotonic() + timeout_s
     last_error = None
-    url = f"{base_url.rstrip('/')}/model_info"
+    base = base_url.rstrip("/")
+    # Newer SGLang serves model info at /get_model_info on the root, not /v1.
+    root = base[: -len("/v1")] if base.endswith("/v1") else base
+    urls = [f"{base}/model_info", f"{root}/get_model_info", f"{root}/health"]
     while time.monotonic() < deadline:
-        try:
-            response = requests.get(url, timeout=5)
-            if response.ok:
-                return
-            last_error = f"HTTP {response.status_code}: {response.text[:200]}"
-        except requests.RequestException as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
+        for url in urls:
+            try:
+                response = requests.get(url, timeout=5)
+                if response.ok:
+                    return
+                last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+            except requests.RequestException as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
         time.sleep(2)
     raise TimeoutError(f"SGLang server did not become ready: {last_error}")
 
