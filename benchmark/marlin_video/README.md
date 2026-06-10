@@ -2,6 +2,8 @@
 
 This benchmark is for running `NemoStation/Marlin-2B` through SGLang's OpenAI-compatible server and comparing it with the custom MLX 8-bit results from `junwatu/Marlin-2B-MLX-8bit`.
 
+For Apple Silicon SGLang MLX vs custom MLX hybrid instructions, see [README_MLX.md](README_MLX.md).
+
 The model is Marlin. The SGLang execution class override below is only needed because the checkpoint advertises `MarlinForConditionalGeneration`, while this SGLang fork can execute it through the native Qwen3.5 implementation.
 
 ## Environment
