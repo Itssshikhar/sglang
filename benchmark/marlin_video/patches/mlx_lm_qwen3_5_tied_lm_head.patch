@@ -1,0 +1,25 @@
+Fix mlx_lm qwen3_5 weight sanitization for VL checkpoints with tied embeddings.
+
+Marlin-2B (model_type=qwen3_5, tie_word_embeddings=true) ships an explicit
+`lm_head.weight` in its safetensors. mlx_lm's VL wrapper sanitize() prefixes
+every un-prefixed checkpoint key with `language_model.`, so the key reaches
+TextModel.sanitize() as `language_model.lm_head.weight` — but the tied-
+embeddings drop only pops the un-prefixed name, and load_weights(strict=True)
+then fails with:
+
+    ValueError: Received 1 parameters not in model: language_model.lm_head.weight.
+
+Apply to the installed mlx_lm (tested against mlx-lm 0.31.3 site-packages):
+
+    cd <venv>/lib/python3.12/site-packages
+    patch -p0 < mlx_lm_qwen3_5_tied_lm_head.patch
+
+--- mlx_lm/models/qwen3_5.py
++++ mlx_lm/models/qwen3_5.py
+@@ -314,6 +314,7 @@
+         if self.args.tie_word_embeddings:
+             weights.pop("lm_head.weight", None)
++            weights.pop("language_model.lm_head.weight", None)
+
+         norm_keys = (
+             ".input_layernorm.weight",

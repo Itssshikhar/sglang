@@ -1,5 +1,13 @@
 # Marlin MLX Comparison Benchmark
 
+> **Errata (2026-06-11):** see [MLX_BENCHMARK_REPORT.md](MLX_BENCHMARK_REPORT.md)
+> for actual results and required corrections to these instructions. Notably:
+> this benchmark must run on upstream sglang `main` (this branch's base has no
+> MLX backend) with `patches/sglang_main_mps_mlx_fixes.patch` applied, and the
+> SGLang MLX path currently **drops video features entirely** — its captions
+> are hallucinated. A working custom runner is provided in
+> `marlin_mlx_hybrid.py`.
+
 This benchmark compares two Apple Silicon paths for Marlin video captioning:
 
 1. SGLang's native MLX runtime, launched with `SGLANG_USE_MLX=1`.
