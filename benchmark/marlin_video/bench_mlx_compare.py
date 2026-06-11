@@ -125,10 +125,10 @@ def wait_for_sglang(base_url: str, timeout_s: float) -> None:
     raise TimeoutError(f"SGLang server did not become ready: {last_error}")
 
 
-def request_sglang_once(
-    args: argparse.Namespace, video_url: str, run_index: int, warmup: bool
+def build_sglang_payload(
+    args: argparse.Namespace, video_url: str, *, stream: bool = False
 ) -> dict[str, Any]:
-    payload = {
+    payload: dict[str, Any] = {
         "model": args.sglang_model,
         "messages": [
             {
@@ -142,6 +142,19 @@ def request_sglang_once(
         "temperature": args.temperature,
         "max_tokens": args.max_tokens,
     }
+    if stream:
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+    return payload
+
+
+def request_sglang_once(
+    args: argparse.Namespace, video_url: str, run_index: int, warmup: bool
+) -> dict[str, Any]:
+    if args.sglang_stream:
+        return request_sglang_stream_once(args, video_url, run_index, warmup)
+
+    payload = build_sglang_payload(args, video_url)
     start = time.perf_counter()
     try:
         response = requests.post(
@@ -154,12 +167,14 @@ def request_sglang_once(
     except Exception as exc:
         elapsed_s = time.perf_counter() - start
         return {
+            "row_type": "request",
             "backend": "sglang_mlx",
             "ok": False,
             "warmup": warmup,
             "run_index": run_index,
             "video_url": video_url,
             "elapsed_s": elapsed_s,
+            "timings_s": {"request_total_s": elapsed_s},
             "error": f"{type(exc).__name__}: {exc}",
         }
 
@@ -169,6 +184,7 @@ def request_sglang_once(
     completion_tokens = usage.get("completion_tokens")
     total_tokens = usage.get("total_tokens")
     row = {
+        "row_type": "request",
         "backend": "sglang_mlx",
         "ok": response.ok,
         "status_code": response.status_code,
@@ -176,6 +192,7 @@ def request_sglang_once(
         "run_index": run_index,
         "video_url": video_url,
         "elapsed_s": elapsed_s,
+        "timings_s": {"request_total_s": elapsed_s},
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
@@ -187,6 +204,114 @@ def request_sglang_once(
     }
     if not response.ok:
         row["error"] = result
+    return row
+
+
+def request_sglang_stream_once(
+    args: argparse.Namespace, video_url: str, run_index: int, warmup: bool
+) -> dict[str, Any]:
+    payload = build_sglang_payload(args, video_url, stream=True)
+    start = time.perf_counter()
+    first_content_s = None
+    text_parts = []
+    usage: dict[str, Any] = {}
+    status_code = None
+    try:
+        response = requests.post(
+            f"{args.sglang_base_url.rstrip('/')}/chat/completions",
+            json=payload,
+            timeout=args.request_timeout,
+            stream=True,
+        )
+        status_code = response.status_code
+        if not response.ok:
+            elapsed_s = time.perf_counter() - start
+            return {
+                "row_type": "request",
+                "backend": "sglang_mlx",
+                "ok": False,
+                "status_code": status_code,
+                "warmup": warmup,
+                "run_index": run_index,
+                "video_url": video_url,
+                "elapsed_s": elapsed_s,
+                "timings_s": {"request_total_s": elapsed_s},
+                "error": response.text[:1000],
+            }
+
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:") :].strip()
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            content = delta.get("content")
+            if content:
+                if first_content_s is None:
+                    first_content_s = time.perf_counter() - start
+                text_parts.append(content)
+        elapsed_s = time.perf_counter() - start
+    except Exception as exc:
+        elapsed_s = time.perf_counter() - start
+        return {
+            "row_type": "request",
+            "backend": "sglang_mlx",
+            "ok": False,
+            "status_code": status_code,
+            "warmup": warmup,
+            "run_index": run_index,
+            "video_url": video_url,
+            "elapsed_s": elapsed_s,
+            "timings_s": {"request_total_s": elapsed_s},
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    completion_tokens = usage.get("completion_tokens")
+    total_tokens = usage.get("total_tokens")
+    stream_decode_s = (
+        elapsed_s - first_content_s if first_content_s is not None else None
+    )
+    timings_s = {"request_total_s": elapsed_s}
+    if first_content_s is not None:
+        timings_s["ttft_s"] = first_content_s
+    if stream_decode_s is not None:
+        timings_s["stream_decode_s"] = stream_decode_s
+
+    row = {
+        "row_type": "request",
+        "backend": "sglang_mlx",
+        "ok": True,
+        "status_code": status_code,
+        "stream": True,
+        "warmup": warmup,
+        "run_index": run_index,
+        "video_url": video_url,
+        "elapsed_s": elapsed_s,
+        "timings_s": timings_s,
+        "ttft_s": first_content_s,
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "completion_tokens_per_s": (
+            completion_tokens / elapsed_s if completion_tokens and elapsed_s else None
+        ),
+        "total_tokens_per_s": total_tokens / elapsed_s if total_tokens and elapsed_s else None,
+        "text": "".join(text_parts),
+    }
+    if completion_tokens and stream_decode_s is not None and completion_tokens > 1:
+        row["post_ttft_tokens_per_s"] = (completion_tokens - 1) / stream_decode_s
     return row
 
 
@@ -296,6 +421,7 @@ def custom_base_row(
     elapsed_s: float,
 ) -> dict[str, Any]:
     return {
+        "row_type": "request",
         "backend": "custom_mlx_hybrid",
         "ok": False,
         "warmup": warmup,
@@ -314,15 +440,33 @@ def merge_custom_result(row: dict[str, Any], result: Any) -> None:
         completion_tokens = result.get("completion_tokens") or usage.get(
             "completion_tokens"
         )
+        prompt_tokens = result.get("prompt_tokens") or usage.get("prompt_tokens")
         total_tokens = result.get("total_tokens") or usage.get("total_tokens")
         if text is not None:
             row["text"] = text
+        if prompt_tokens is not None:
+            row["prompt_tokens"] = prompt_tokens
         if completion_tokens is not None:
             row["completion_tokens"] = completion_tokens
             row["completion_tokens_per_s"] = completion_tokens / row["elapsed_s"]
         if total_tokens is not None:
             row["total_tokens"] = total_tokens
             row["total_tokens_per_s"] = total_tokens / row["elapsed_s"]
+        timings = result.get("timings_s")
+        if isinstance(timings, dict):
+            row["timings_s"] = timings
+            ttft_s = result.get("time_to_first_token_s")
+            if ttft_s is None:
+                ttft_s = timings.get("time_to_first_token_s")
+            decode_s = timings.get("mlx_decode_s") or timings.get("decode_s")
+            if ttft_s is not None:
+                row["ttft_s"] = ttft_s
+            if decode_s is not None:
+                row["decode_s"] = decode_s
+            if completion_tokens is not None and decode_s:
+                row["decode_tokens_per_s"] = completion_tokens / decode_s
+        if result.get("decode_tokens_per_s") is not None:
+            row["decode_tokens_per_s"] = result["decode_tokens_per_s"]
         if "ok" in result:
             row["ok"] = bool(result["ok"])
     elif result is not None:
@@ -338,8 +482,20 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             row
             for row in rows
             if row.get("backend") == backend and row.get("ok") and not row.get("warmup")
+            and row.get("row_type", "request") == "request"
         ]
         summary[backend] = summarize_rows(measured)
+        startup_rows = [
+            row
+            for row in rows
+            if row.get("backend") == backend
+            and row.get("ok")
+            and row.get("row_type") == "sglang_server_start"
+        ]
+        if startup_rows:
+            summary[backend]["server_startup_s"] = summarize_metric(
+                row["elapsed_s"] for row in startup_rows if row.get("elapsed_s")
+            )
     if "sglang_mlx" in summary and "custom_mlx_hybrid" in summary:
         sglang_elapsed = (summary["sglang_mlx"].get("elapsed_s") or {}).get("mean")
         custom_elapsed = (summary["custom_mlx_hybrid"].get("elapsed_s") or {}).get(
@@ -362,21 +518,46 @@ def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         return {"num_measured": 0}
 
     def metric(name: str) -> dict[str, float] | None:
-        vals = [row[name] for row in rows if row.get(name) is not None]
-        if not vals:
-            return None
-        return {
-            "mean": statistics.mean(vals),
-            "median": statistics.median(vals),
-            "min": min(vals),
-            "max": max(vals),
+        return summarize_metric(row[name] for row in rows if row.get(name) is not None)
+
+    timing_names = sorted(
+        {
+            name
+            for row in rows
+            for name in (row.get("timings_s") or {})
+            if row.get("timings_s", {}).get(name) is not None
         }
+    )
 
     return {
         "num_measured": len(rows),
         "elapsed_s": metric("elapsed_s"),
+        "ttft_s": metric("ttft_s"),
+        "decode_s": metric("decode_s"),
         "completion_tokens_per_s": metric("completion_tokens_per_s"),
+        "decode_tokens_per_s": metric("decode_tokens_per_s"),
+        "post_ttft_tokens_per_s": metric("post_ttft_tokens_per_s"),
         "total_tokens_per_s": metric("total_tokens_per_s"),
+        "timings_s": {
+            name: summarize_metric(
+                row["timings_s"][name]
+                for row in rows
+                if row.get("timings_s", {}).get(name) is not None
+            )
+            for name in timing_names
+        },
+    }
+
+
+def summarize_metric(values: Any) -> dict[str, float] | None:
+    vals = list(values)
+    if not vals:
+        return None
+    return {
+        "mean": statistics.mean(vals),
+        "median": statistics.median(vals),
+        "min": min(vals),
+        "max": max(vals),
     }
 
 
@@ -427,18 +608,47 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     rows = []
     server_proc = None
     try:
-        if args.mode in {"sglang-mlx", "both"} and args.launch_sglang:
-            cmd = build_sglang_command(args)
-            env = os.environ.copy()
-            env["SGLANG_USE_MLX"] = "1"
-            if args.sglang_use_custom_rope:
-                env["SGLANG_MLX_USE_CUSTOM_ROPE"] = "1"
-            print("starting SGLang MLX server:")
-            print(" ".join(shlex.quote(part) for part in cmd))
-            server_proc = subprocess.Popen(cmd, env=env, text=True)
-            wait_for_sglang(args.sglang_base_url, args.server_ready_timeout)
-
         with output_path.open("a", encoding="utf-8") as f:
+            if args.mode in {"sglang-mlx", "both"} and args.launch_sglang:
+                cmd = build_sglang_command(args)
+                env = os.environ.copy()
+                env["SGLANG_USE_MLX"] = "1"
+                if args.sglang_use_custom_rope:
+                    env["SGLANG_MLX_USE_CUSTOM_ROPE"] = "1"
+                print("starting SGLang MLX server:")
+                print(" ".join(shlex.quote(part) for part in cmd))
+                start = time.perf_counter()
+                server_proc = subprocess.Popen(cmd, env=env, text=True)
+                try:
+                    wait_for_sglang(args.sglang_base_url, args.server_ready_timeout)
+                    elapsed_s = time.perf_counter() - start
+                    row = {
+                        "row_type": "sglang_server_start",
+                        "backend": "sglang_mlx",
+                        "ok": True,
+                        "elapsed_s": elapsed_s,
+                        "command": cmd,
+                        "base_url": args.sglang_base_url,
+                    }
+                except Exception as exc:
+                    elapsed_s = time.perf_counter() - start
+                    row = {
+                        "row_type": "sglang_server_start",
+                        "backend": "sglang_mlx",
+                        "ok": False,
+                        "elapsed_s": elapsed_s,
+                        "command": cmd,
+                        "base_url": args.sglang_base_url,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    write_row(f, row)
+                    rows.append(row)
+                    print_row(row)
+                    raise
+                write_row(f, row)
+                rows.append(row)
+                print_row(row)
+
             for video_index, video_url in enumerate(videos):
                 for run_index in range(args.warmup + args.runs):
                     warmup = run_index < args.warmup
@@ -475,15 +685,25 @@ def write_row(f, row: dict[str, Any]) -> None:
 
 
 def print_row(row: dict[str, Any]) -> None:
+    if row.get("row_type") == "sglang_server_start":
+        status = "ok" if row.get("ok") else "failed"
+        print(
+            f"event backend=sglang_mlx type=server_start {status} "
+            f"elapsed={row['elapsed_s']:.3f}s"
+        )
+        return
+
     label = "warmup" if row.get("warmup") else "run"
     backend = row.get("backend", "unknown")
     if row.get("ok"):
         tps = row.get("completion_tokens_per_s")
         tps_str = f"{tps:.2f}" if tps is not None else "n/a"
+        ttft = row.get("ttft_s")
+        ttft_str = f" ttft={ttft:.3f}s" if ttft is not None else ""
         print(
             f"{label} backend={backend} video={row.get('video_index')} "
             f"idx={row.get('run_index')} elapsed={row['elapsed_s']:.3f}s "
-            f"completion_tps={tps_str}"
+            f"completion_tps={tps_str}{ttft_str}"
         )
     else:
         print(
@@ -562,6 +782,14 @@ def main() -> None:
         "--sglang-use-custom-rope",
         action="store_true",
         help="Set SGLANG_MLX_USE_CUSTOM_ROPE=1 for the SGLang run.",
+    )
+    parser.add_argument(
+        "--sglang-stream",
+        action="store_true",
+        help=(
+            "Use streaming chat completions for SGLang requests and record TTFT "
+            "when the server emits token deltas."
+        ),
     )
 
     parser.add_argument("--custom-model-path", default="junwatu/Marlin-2B-MLX-8bit")

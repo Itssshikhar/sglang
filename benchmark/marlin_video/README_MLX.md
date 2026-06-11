@@ -185,8 +185,29 @@ If the command prints a final JSON line, the script records it. The most useful
 shape is:
 
 ```json
-{"ok": true, "text": "...", "usage": {"completion_tokens": 267, "total_tokens": 3518}}
+{
+  "ok": true,
+  "text": "...",
+  "usage": {"prompt_tokens": 3251, "completion_tokens": 267, "total_tokens": 3518},
+  "timings_s": {
+    "video_fetch_s": 0.12,
+    "hf_processor_load_s": 1.34,
+    "hf_model_load_s": 9.87,
+    "hf_processor_apply_s": 2.01,
+    "mrope_compute_s": 0.43,
+    "mlx_model_load_s": 8.76,
+    "mlx_vision_encode_s": 1.55,
+    "mlx_prefill_s": 3.21,
+    "mlx_decode_s": 42.0,
+    "total_s": 75.04
+  }
+}
 ```
+
+The included `benchmark/marlin_video/marlin_mlx_hybrid.py` runner emits these
+component timings. It intentionally remains a CLI process, matching the custom
+MLX path as published instead of turning it into a resident service for the
+sake of an artificial apples-to-apples serving comparison.
 
 Use `--custom-callable` if your custom runner exposes a Python function:
 
@@ -238,6 +259,34 @@ python benchmark/marlin_video/bench_mlx_compare.py \
   --warmup 1 \
   --runs 5 \
   --output benchmark/marlin_video/mlx_compare_results.jsonl
+```
+
+This is the primary practical end-to-end benchmark:
+
+- SGLang is measured in its intended resident server form.
+- The custom MLX path is measured in its provided CLI/script form.
+- The elapsed-time ratio is therefore a packaging/runtime comparison, not proof
+  that SGLang's inner MLX kernels are that much faster.
+
+The harness records a separate `sglang_server_start` event row when it launches
+SGLang. That startup row is reported in the summary as `server_startup_s` but is
+excluded from per-request latency means and backend ratios.
+
+To record SGLang streaming time-to-first-token, add `--sglang-stream`:
+
+```bash
+python benchmark/marlin_video/bench_mlx_compare.py \
+  --mode sglang-mlx \
+  --sglang-stream \
+  --sglang-model-path junwatu/Marlin-2B-MLX-8bit \
+  --sglang-tokenizer-path NemoStation/Marlin-2B \
+  --sglang-extra-arg="--json-model-override-args '{\"architectures\":[\"Qwen3_5ForConditionalGeneration\"]}'" \
+  --sglang-extra-arg=--disable-radix-cache \
+  --disable-overlap-schedule \
+  --video-url https://github.com/sgl-project/sgl-test-files/raw/refs/heads/main/videos/jobs_presenting_ipod.mp4 \
+  --max-tokens 256 \
+  --warmup 1 \
+  --runs 5
 ```
 
 For the synchronous SGLang MLX scheduler path:
@@ -298,22 +347,39 @@ benchmark/marlin_video/mlx_compare_results.jsonl
 
 Each row includes:
 
+- `row_type`: `request`, or `sglang_server_start` for a server launch event
 - `backend`: `sglang_mlx` or `custom_mlx_hybrid`
 - `warmup`
 - `run_index`
 - `video_url`
 - `elapsed_s`
+- optional `timings_s` component timings
+- optional `ttft_s`, `decode_s`, `decode_tokens_per_s`, and
+  `post_ttft_tokens_per_s`
 - optional token counts and token/sec metrics
 - generated text or raw custom command output
 
+For SGLang streaming rows, `ttft_s` is request-start to first streamed content
+delta. For the included custom CLI, `ttft_s` is process-start to first generated
+token, so it intentionally includes imports and model loading.
+
 The final stdout summary groups measured, non-warmup rows by backend and includes
-the mean elapsed-time ratio when both backends have successful measured runs.
+the mean elapsed-time ratio when both backends have successful measured request
+runs. It also aggregates nested `timings_s` fields, so custom CLI cold-start
+costs can be separated from model prefill/decode work.
 
 ## Notes For Fair Comparisons
 
 - Use the same `video_url`, prompt, `max_tokens`, and temperature for both paths.
-- Treat first-request latency separately. It can include model load, video
-  download, preprocessing, kernel compilation, and cache misses.
+- Keep the headline comparison framed as practical end-to-end latency: resident
+  SGLang server versus custom MLX CLI/script. Do not describe that ratio as pure
+  MLX inference-engine speed.
+- Treat server startup and first-request latency separately. They can include
+  model load, video download, preprocessing, kernel compilation, and cache
+  misses.
+- Inspect custom `timings_s` before drawing conclusions. If most custom time is
+  `hf_model_load_s` or `mlx_model_load_s`, the benchmark is telling you about
+  process/reload overhead, not decode throughput.
 - If you compare SGLang overlap scheduling against a synchronous custom hybrid
   runner, report that explicitly. Use `--disable-overlap-schedule` for a simpler
   sync-vs-sync comparison.

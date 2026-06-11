@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "torchcodec")
 os.environ.setdefault("VIDEO_MAX_PIXELS", "200704")
@@ -47,28 +48,45 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.0)
     args = ap.parse_args()
 
+    total_start = time.perf_counter()
+    timings: dict[str, float] = {}
+
+    def mark(name: str, start: float) -> None:
+        timings[name] = time.perf_counter() - start
+
     try:
+        start = time.perf_counter()
         import mlx.core as mx
         import torch
         from transformers import AutoModelForCausalLM, AutoProcessor
         from mlx_vlm import load as mlx_load
         from mlx_vlm.models.cache import make_prompt_cache
 
+        mark("imports_s", start)
+
+        start = time.perf_counter()
         video_path = fetch_video(args.video_url)
+        mark("video_fetch_s", start)
 
         # 1. HF side: tokenize video + prompt, compute M-RoPE position ids.
         # bf16 instead of the card's fp32: get_rope_index only produces integer
         # position indices, weight dtype does not affect it, and fp32 would not
         # fit comfortably in 16 GB alongside the MLX model.
+        start = time.perf_counter()
         hf_processor = AutoProcessor.from_pretrained(
             args.hf_model, trust_remote_code=True
         )
+        mark("hf_processor_load_s", start)
+
+        start = time.perf_counter()
         hf_model = AutoModelForCausalLM.from_pretrained(
             args.hf_model,
             trust_remote_code=True,
             dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
         )
+        mark("hf_model_load_s", start)
+
         messages = [
             {
                 "role": "user",
@@ -78,6 +96,7 @@ def main() -> None:
                 ],
             }
         ]
+        start = time.perf_counter()
         inputs = hf_processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -85,6 +104,9 @@ def main() -> None:
             return_tensors="pt",
             return_dict=True,
         )
+        mark("hf_processor_apply_s", start)
+
+        start = time.perf_counter()
         with torch.no_grad():
             position_ids, _ = hf_model.model.get_rope_index(
                 input_ids=inputs["input_ids"],
@@ -92,22 +114,42 @@ def main() -> None:
                 video_grid_thw=inputs.get("video_grid_thw"),
                 attention_mask=inputs.get("attention_mask"),
             )
+        mark("mrope_compute_s", start)
+
+        start = time.perf_counter()
         del hf_model
+        mark("hf_model_release_s", start)
 
         # 2. MLX side: vision encode + generate.
+        start = time.perf_counter()
         mlx_model, mlx_processor = mlx_load(args.model)
+        mark("mlx_model_load_s", start)
+
+        start = time.perf_counter()
         input_ids = mx.array(inputs["input_ids"].numpy())
         pixel_values = mx.array(inputs["pixel_values_videos"].numpy())
         video_grid_thw = mx.array(inputs["video_grid_thw"].numpy())
+        mx.eval(input_ids, pixel_values, video_grid_thw)
+        mark("mlx_input_conversion_s", start)
 
         # Replicate get_input_embeddings minus its internal get_rope_index call,
         # which crashes on Marlin's interleaved timestamp/video token layout in
         # mlx_vlm 0.6.3. The HF-computed position ids are authoritative anyway.
         dtype = mlx_model.vision_tower.patch_embed.proj.weight.dtype
+
+        start = time.perf_counter()
         inputs_embeds = mlx_model.language_model.model.embed_tokens(input_ids)
+        mx.eval(inputs_embeds)
+        mark("mlx_text_embedding_s", start)
+
+        start = time.perf_counter()
         hidden_states, _ = mlx_model.vision_tower(
             pixel_values.astype(dtype), video_grid_thw
         )
+        mx.eval(hidden_states)
+        mark("mlx_vision_encode_s", start)
+
+        start = time.perf_counter()
         inputs_embeds, _ = mlx_model.merge_input_ids_with_image_features(
             hidden_states,
             inputs_embeds,
@@ -115,6 +157,8 @@ def main() -> None:
             mlx_model.config.image_token_index,
             mlx_model.config.video_token_index,
         )
+        mx.eval(inputs_embeds)
+        mark("mlx_embedding_merge_s", start)
 
         class _Embeds:
             pass
@@ -124,34 +168,56 @@ def main() -> None:
         mlx_model.language_model._position_ids = mx.array(position_ids.numpy())
         mlx_model.language_model._rope_deltas = None
 
+        start = time.perf_counter()
         prompt_cache = make_prompt_cache(mlx_model.language_model)
         outputs = mlx_model.language_model(
             input_ids,
             inputs_embeds=embedding_output.inputs_embeds,
             cache=prompt_cache,
         )
-        mx.eval([c.state for c in prompt_cache])
+        mx.eval(outputs.logits, [c.state for c in prompt_cache])
+        mark("mlx_prefill_s", start)
 
         eos = mlx_model.config.eos_token_id
         eos_ids = set(eos) if isinstance(eos, (list, tuple)) else {eos}
+
+        start = time.perf_counter()
         y = mx.argmax(outputs.logits[:, -1, :], axis=-1, keepdims=True)
+        mx.eval(y)
         tokens = []
+        time_to_first_token_s = None
         for _ in range(args.max_tokens):
             t = y.item()
             if t in eos_ids:
                 break
+            if time_to_first_token_s is None:
+                time_to_first_token_s = time.perf_counter() - total_start
             tokens.append(t)
+            if len(tokens) >= args.max_tokens:
+                break
             outputs = mlx_model.language_model(y, cache=prompt_cache)
-            mx.eval([c.state for c in prompt_cache])
             y = mx.argmax(outputs.logits[:, -1, :], axis=-1, keepdims=True)
+            mx.eval(y, [c.state for c in prompt_cache])
+        mark("mlx_decode_s", start)
 
+        start = time.perf_counter()
         text = mlx_processor.tokenizer.decode(tokens, skip_special_tokens=True)
+        mark("token_decode_s", start)
+
         prompt_tokens = int(inputs["input_ids"].shape[1])
+        timings["total_s"] = time.perf_counter() - total_start
         print(
             json.dumps(
                 {
                     "ok": True,
                     "text": text,
+                    "timings_s": timings,
+                    "time_to_first_token_s": time_to_first_token_s,
+                    "decode_tokens_per_s": (
+                        len(tokens) / timings["mlx_decode_s"]
+                        if timings["mlx_decode_s"] > 0
+                        else None
+                    ),
                     "usage": {
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": len(tokens),
@@ -163,8 +229,17 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001 - benchmark wants a JSON error line
         import traceback
 
+        timings["total_s"] = time.perf_counter() - total_start
         traceback.print_exc(file=sys.stderr)
-        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "timings_s": timings,
+                }
+            )
+        )
         sys.exit(1)
 
 

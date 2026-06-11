@@ -127,6 +127,20 @@ Caption agreement:
   close-up shots of a silver iPod-style device.
 - Custom hybrid: described the same stage/product-demo scene and device context.
 
+Follow-up benchmark harness change:
+
+- The comparison harness now records SGLang server startup as a separate
+  `sglang_server_start` event instead of folding it into request means.
+- SGLang requests can opt into streaming with `--sglang-stream`, which records
+  `ttft_s` and post-TTFT token throughput when streamed usage is available.
+- The included custom MLX CLI now emits component timings for video fetch, HF
+  processor/model load, M-RoPE compute, MLX model load, vision encode, prefill,
+  and decode. This keeps the primary comparison faithful to the published
+  custom CLI shape while making reload and preprocessing overhead explicit.
+- Therefore the fixed-branch elapsed ratio should be read as practical
+  resident-server-vs-CLI latency, not as isolated MLX kernel or inference-engine
+  speed.
+
 ## Earlier branch smoke result before follow-up fixes (2026-06-11)
 
 Branch tested: `marlin-mlx-mm-support` at `5e14f1d021` (`Use MLX
