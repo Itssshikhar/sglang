@@ -2,6 +2,11 @@
 
 Benchmark report, 2026-06-11.
 
+> Implementation note: this report captures the pre-fix behavior that motivated
+> the MLX multimodal work. The current branch adds an experimental
+> Marlin/Qwen3.5 MLX multimodal path that must be re-benchmarked on Apple
+> Silicon with `--disable-radix-cache --disable-overlap-schedule`.
+
 ## TL;DR
 
 | | SGLang MLX server | Custom MLX hybrid |
@@ -125,6 +130,7 @@ python benchmark/marlin_video/bench_mlx_compare.py \
   --sglang-model-path junwatu/Marlin-2B-MLX-8bit \
   --sglang-extra-arg="--json-model-override-args '{\"architectures\":[\"Qwen3_5ForConditionalGeneration\"]}'" \
   --sglang-extra-arg="--disable-radix-cache" \
+  --sglang-extra-arg="--disable-overlap-schedule" \
   --warmup 1 --runs 3
 ```
 
@@ -189,9 +195,8 @@ Raw per-run rows (including all failed attempts above) are appended to
 
 ## Open follow-ups
 
-1. **SGLang MLX multimodal support** — the blocker for any real SGLang-side
-   number. Until then, `sglang-mlx` mode measures text throughput through a
-   video-shaped request, not captioning.
+1. Re-run SGLang MLX with this branch's experimental multimodal path and verify
+   the generated caption describes the input video.
 2. Upstream the five sglang MPS/hybrid-SSM fixes in
    `patches/sglang_main_mps_mlx_fixes.patch`.
 3. Report the mlx_vlm qwen3_5 `get_rope_index` crash (failure #13) upstream.

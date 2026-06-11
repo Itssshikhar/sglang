@@ -145,6 +145,7 @@ srt_mps = [
     "torchvision",
     "mlx",
     "mlx-lm",
+    "mlx-vlm",
 ]
 
 diffusion_mps = [

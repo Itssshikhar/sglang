@@ -18,6 +18,14 @@ except (ImportError, RuntimeError):
 _cuda_backend_enabled: bool | None = None
 
 
+def _maybe_pin(t):
+    """Pin only when CUDA is available: pinning speeds up CUDA H2D copies and
+    raises a device-mismatch error on MPS builds of torch."""
+    import torch
+
+    return t.pin_memory() if torch.cuda.is_available() else t
+
+
 def _try_cuda_backend() -> bool:
     """Try to enable torchcodec CUDA backend. Caches result after first call."""
     global _cuda_backend_enabled
@@ -127,10 +135,10 @@ class VideoDecoderWrapper:
 
         if _BACKEND == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
-            return batch.data.pin_memory()
+            return _maybe_pin(batch.data)
         else:
             arr = self._decoder.get_batch(indices).asnumpy()
-            return torch.from_numpy(arr).pin_memory()
+            return _maybe_pin(torch.from_numpy(arr))
 
     def _parallel_decode(self, indices, num_threads):
         """Decode frames using multiple VideoDecoder instances in parallel threads."""
@@ -156,7 +164,7 @@ class VideoDecoderWrapper:
                 idx = future_to_idx[future]
                 results[idx] = future.result()
 
-        return torch.cat(results, dim=0).pin_memory()
+        return _maybe_pin(torch.cat(results, dim=0))
 
     @property
     def source_bytes(self) -> bytes | None:

@@ -46,6 +46,11 @@ if _HAS_MLX:
         MlxPendingJob,
         SchedulerMlxOverlapMixin,
     )
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputs,
+    )
     from sglang.srt.managers.scheduler_components import (
         batch_result_processor as batch_result_processor_module,
     )
@@ -206,6 +211,58 @@ class TestMlxAttentionPatching(unittest.TestCase):
         self.assertEqual(n_kv_heads, 1)
         self.assertEqual(head_dim, 2)
         self.assertEqual(dtype, mx.float32)
+
+    def test_multimodal_forward_ids_are_clamped_with_input_embeds(self):
+        runner = object.__new__(MlxModelRunner)
+        runner.model = SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=FakeEmbedding(3, 2))
+        )
+
+        input_ids = MlxModelRunner._forward_token_array(
+            runner,
+            token_ids=[0, 99, -4],
+            input_embeds=mx.zeros((1, 3, 2), dtype=mx.float32),
+        )
+
+        self.assertEqual(input_ids.tolist(), [[0, 2, 0]])
+        plain_ids = MlxModelRunner._forward_token_array(
+            runner,
+            token_ids=[0, 99, -4],
+            input_embeds=None,
+        )
+        self.assertEqual(plain_ids.tolist(), [[0, 99, -4]])
+
+    def test_multimodal_input_embeds_scatter_chunk_intersection(self):
+        runner = object.__new__(MlxModelRunner)
+        runner.enable_multimodal = True
+        runner.model = SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=FakeEmbedding(16, 2))
+        )
+        mm_item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(1, 2)],
+            precomputed_embeddings=mx.array(
+                [[101.0, 102.0], [201.0, 202.0]], dtype=mx.float32
+            ),
+        )
+        mm_inputs = MultimodalInputs(
+            mm_items=[mm_item],
+            mrope_positions=torch.arange(12, dtype=torch.long).reshape(3, 4),
+            mrope_position_delta=torch.tensor([[7]], dtype=torch.long),
+        )
+
+        input_embeds, mrope_positions = MlxModelRunner._build_multimodal_input_embeds(
+            runner,
+            token_ids=[99, 5],
+            mm_inputs=mm_inputs,
+            prefix_len=1,
+        )
+        mx.eval(input_embeds, mrope_positions)
+
+        self.assertEqual(input_embeds.shape, (1, 2, 2))
+        self.assertEqual(input_embeds[0, 0].tolist(), [101.0, 102.0])
+        self.assertEqual(input_embeds[0, 1].tolist(), [201.0, 202.0])
+        self.assertEqual(mrope_positions.tolist(), [[1, 2], [5, 6], [9, 10]])
 
     def test_attn_config_rejects_heterogeneous_kv_shapes(self):
         runner = object.__new__(MlxModelRunner)
@@ -1241,6 +1298,17 @@ if _HAS_MLX:
         def __call__(self, x):
             shape = (*x.shape[:-1], self.weight.shape[0])
             return mx.zeros(shape, dtype=x.dtype)
+
+    class FakeEmbedding(nn.Module):
+        def __init__(self, vocab_size: int, hidden_size: int):
+            super().__init__()
+            self.weight = mx.arange(
+                vocab_size * hidden_size,
+                dtype=mx.float32,
+            ).reshape(vocab_size, hidden_size)
+
+        def __call__(self, input_ids):
+            return self.weight[input_ids]
 
     class FakeAttention(nn.Module):
         def __init__(self, use_aliases: bool = False):

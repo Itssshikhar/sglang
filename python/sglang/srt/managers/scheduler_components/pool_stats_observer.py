@@ -192,9 +192,12 @@ class SchedulerPoolStatsObserver:
         return self.tree_cache.session_held_mamba_slots(self.active_pool_idxs())
 
     def get_pool_stats(self) -> PoolStats:
+        # MLX's MlxAuxiliaryStateReqToTokenPool tracks SSM state internally and
+        # exposes no mamba_allocator; report plain token stats in that case.
+        has_mamba_pool = hasattr(self.req_to_token_pool, "mamba_allocator")
         if self.is_hybrid_swa:
             pool_stats = self._get_swa_token_info()
-        elif self.is_hybrid_ssm:
+        elif self.is_hybrid_ssm and has_mamba_pool:
             pool_stats = self._get_mamba_token_info()
         else:
             pool_stats = self._get_token_info()
@@ -203,7 +206,7 @@ class SchedulerPoolStatsObserver:
             pool_stats = self._get_hisparse_token_info(pool_stats)
 
         # swa + ssm can coexist: overlay mamba fields onto swa stats
-        if self.is_hybrid_ssm:
+        if self.is_hybrid_ssm and has_mamba_pool:
             mamba_stats = self._get_mamba_token_info()
             pool_stats.is_hybrid_ssm = True
             pool_stats.mamba_num_used = mamba_stats.mamba_num_used

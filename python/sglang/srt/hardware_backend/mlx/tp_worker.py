@@ -48,12 +48,22 @@ class MlxTpModelWorker(TpModelWorker):
         )
 
         logger.info("Initializing MlxModelRunner for end-to-end MLX inference")
+        enable_multimodal = bool(self.model_config.is_multimodal)
+        if enable_multimodal and not self.server_args.disable_radix_cache:
+            raise RuntimeError(
+                "SGLang MLX multimodal currently requires --disable-radix-cache."
+            )
+        if enable_multimodal and not self.server_args.disable_overlap_schedule:
+            raise RuntimeError(
+                "SGLang MLX multimodal currently requires --disable-overlap-schedule."
+            )
         init_kwargs = dict(
             model_path=self.server_args.model_path,
             trust_remote_code=self.server_args.trust_remote_code,
             disable_radix_cache=self.server_args.disable_radix_cache,
             mem_fraction_static=self.server_args.mem_fraction_static,
             quantization=self.server_args.quantization,
+            enable_multimodal=enable_multimodal,
         )
         if self.server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = self.server_args.max_total_tokens
@@ -176,7 +186,10 @@ class MlxTpModelWorker(TpModelWorker):
                     if seq_len > 1:
                         # Chunked prefill continuation
                         next_token = self._mlx_runner.extend(
-                            req.rid, req_token_ids, req_new_slots
+                            req.rid,
+                            req_token_ids,
+                            req_new_slots,
+                            mm_inputs=req.multimodal_inputs,
                         )
                         extend_rids.append((req.rid, next_token))
                     else:
@@ -194,6 +207,8 @@ class MlxTpModelWorker(TpModelWorker):
                         new_slot_ids=req_new_slots,
                         req_pool_idx=req.req_pool_idx,
                         req=req,
+                        mm_inputs=req.multimodal_inputs,
+                        extend_prefix_len=batch.prefix_lens[i],
                     )
                     prefill_rids.append((req.rid, next_token))
 
@@ -322,6 +337,7 @@ class MlxTpModelWorker(TpModelWorker):
                             req_id=req.rid,
                             new_token_ids=req_token_ids,
                             new_slot_ids=req_new_slots,
+                            mm_inputs=req.multimodal_inputs,
                         )
                     )
                 else:
@@ -340,6 +356,8 @@ class MlxTpModelWorker(TpModelWorker):
                         new_slot_ids=req_new_slots,
                         req_pool_idx=req.req_pool_idx,
                         req=req,
+                        mm_inputs=req.multimodal_inputs,
+                        extend_prefix_len=batch.prefix_lens[i],
                     )
                 )
 

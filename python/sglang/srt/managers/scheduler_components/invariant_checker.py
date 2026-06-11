@@ -277,7 +277,13 @@ class SchedulerInvariantChecker:
             has_leak |= swa_leak
             messages.append(swa_msg)
 
-        if self.is_hybrid_ssm and self.tree_cache.supports_mamba():
+        # MLX's req-to-token pool has no mamba_allocator, so pool stats carry no
+        # mamba fields and the mamba invariant cannot be checked.
+        if (
+            self.is_hybrid_ssm
+            and self.tree_cache.supports_mamba()
+            and ps.mamba_available_size is not None
+        ):
             mamba_leak, mamba_msg = self._check_mamba_pool(ps)
             has_leak |= mamba_leak
             messages.append(mamba_msg)

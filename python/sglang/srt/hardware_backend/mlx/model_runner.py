@@ -22,7 +22,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
+import numpy as np
 import psutil
+import torch
 from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
 from mlx_lm.utils import quantize_model as mlx_lm_quantize_model
@@ -47,6 +49,10 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     set_context,
     uses_sliding_window_attention,
 )
+from sglang.srt.managers.schedule_batch import (
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import get_global_server_args
 
@@ -69,6 +75,7 @@ class MlxPendingPrefill:
     full_token_ids: list[int]
     req_pool_idx: int
     synced_offset: int
+    mrope_position_delta: mx.array | None = None
 
 
 @dataclass
@@ -122,10 +129,14 @@ class MlxModelRunner:
         pool_size: int | None = None,
         mem_fraction_static: float = 0.8,
         quantization: str | None = None,
+        enable_multimodal: bool = False,
     ):
         self.model_path = model_path
         self.trust_remote_code = trust_remote_code
         self.model = None
+        self.vl_model = None
+        self.vl_processor = None
+        self.enable_multimodal = enable_multimodal
         self.disable_radix_cache = disable_radix_cache
         self._mem_fraction_static = mem_fraction_static
         # Counter used to trigger periodic mx.clear_cache() calls.
@@ -135,6 +146,13 @@ class MlxModelRunner:
         # mlx_lm.load() detects the config and instantiates QuantizedLinear
         # modules directly.
         self._quantization: str | None = quantization
+
+        if self.enable_multimodal and not self.disable_radix_cache:
+            raise RuntimeError(
+                "SGLang MLX multimodal currently requires --disable-radix-cache. "
+                "The MLX hybrid-SSM radix cache path does not yet support "
+                "multimodal embedding replacement and M-RoPE state safely."
+            )
 
         self._load_model()
 
@@ -168,6 +186,7 @@ class MlxModelRunner:
 
         self._req_caches: dict[str, list[Any]] = {}
         self._req_token_ids: dict[str, list[int]] = {}
+        self._req_mrope_position_delta: dict[str, mx.array] = {}
         self._cache_pool: list[list[Any]] = []  # reusable full-attention caches
 
         self._attention_kv_pool: MlxAttentionKVPool | None = None
@@ -396,10 +415,19 @@ class MlxModelRunner:
         ]
 
     def _load_model(self):
-        """Load model using mlx_lm. If ``self._quantization`` requests a preset
-        (e.g. ``mlx_q4``), quantize fp16 weights in-place via
-        :func:`mlx_lm.utils.quantize_model` after load.
+        """Load the MLX model.
+
+        Text-only models use ``mlx_lm``. Multimodal models use ``mlx_vlm`` so
+        the vision tower and merge helpers are preserved instead of silently
+        dropping image/video features.
         """
+        if self.enable_multimodal:
+            self._load_multimodal_model()
+        else:
+            self._load_text_model()
+
+    def _load_text_model(self):
+        """Load a text-only model using mlx_lm."""
         logger.info(f"Loading MLX model: {self.model_path}")
         start_time = time.time()
 
@@ -460,6 +488,237 @@ class MlxModelRunner:
 
         load_time = time.time() - start_time
         logger.info(f"MLX model loaded in {load_time:.2f}s")
+
+    def _load_multimodal_model(self):
+        """Load a Qwen3.5/Marlin-style VL model using mlx-vlm."""
+        logger.info(f"Loading MLX multimodal model: {self.model_path}")
+        start_time = time.time()
+
+        try:
+            from mlx_vlm import load as mlx_vlm_load
+        except ImportError as exc:
+            raise RuntimeError(
+                "SGLang MLX multimodal support requires mlx-vlm. "
+                "Install the MPS extras or run `pip install mlx-vlm`."
+            ) from exc
+
+        self.vl_model, self.vl_processor = mlx_vlm_load(self.model_path)
+        language_model = getattr(self.vl_model, "language_model", None)
+        if language_model is None:
+            raise RuntimeError(
+                "Loaded mlx-vlm model does not expose a language_model. "
+                "Only Qwen3.5/Marlin-style mlx-vlm models are supported."
+            )
+        if not hasattr(self.vl_model, "vision_tower"):
+            raise RuntimeError(
+                "Loaded mlx-vlm model does not expose a vision_tower. "
+                "Only Qwen3.5/Marlin-style mlx-vlm models are supported."
+            )
+
+        if self._quantization in _MLX_QUANTIZATION_PRESETS:
+            logger.warning(
+                "Ignoring --quantization=%s for MLX multimodal models. "
+                "Use a pre-quantized mlx-vlm repository such as "
+                "junwatu/Marlin-2B-MLX-8bit.",
+                self._quantization,
+            )
+
+        self.model = language_model
+        mx.eval(self.vl_model.parameters())
+
+        load_time = time.time() - start_time
+        logger.info(f"MLX multimodal model loaded in {load_time:.2f}s")
+
+    @staticmethod
+    def _to_mx_array(value: Any, dtype: mx.Dtype | None = None) -> mx.array:
+        if isinstance(value, mx.array):
+            arr = value
+        elif isinstance(value, torch.Tensor):
+            tensor = value.detach().cpu()
+            if tensor.dtype in (torch.bfloat16, torch.float16):
+                tensor = tensor.float()
+            arr = mx.array(tensor.numpy())
+        elif isinstance(value, np.ndarray):
+            arr = mx.array(value)
+        else:
+            arr = mx.array(value)
+        return arr.astype(dtype) if dtype is not None else arr
+
+    def _text_model(self) -> Any:
+        return getattr(self.model, "model", self.model)
+
+    def _embed_tokens(self) -> Any:
+        return self._text_model().embed_tokens
+
+    def _vocab_size(self) -> int:
+        weight = getattr(self._embed_tokens(), "weight", None)
+        if weight is None:
+            raise RuntimeError("Cannot determine MLX embedding vocab size.")
+        return int(weight.shape[0])
+
+    def _clamped_token_array(self, token_ids: list[int]) -> mx.array:
+        vocab_size = self._vocab_size()
+        safe_ids = [min(max(int(tok), 0), vocab_size - 1) for tok in token_ids]
+        return mx.array([safe_ids], dtype=mx.int32)
+
+    def _forward_token_array(
+        self, token_ids: list[int], input_embeds: mx.array | None
+    ) -> mx.array:
+        if input_embeds is None:
+            return mx.array([token_ids], dtype=mx.int32)
+        return self._clamped_token_array(token_ids)
+
+    def _vision_dtype(self) -> mx.Dtype:
+        tower = self.vl_model.vision_tower
+        proj = getattr(getattr(tower, "patch_embed", None), "proj", None)
+        weight = getattr(proj, "weight", None)
+        if weight is not None:
+            return weight.dtype
+        return self._embed_tokens().weight.dtype
+
+    @staticmethod
+    def _item_token_len(item: MultimodalDataItem) -> int:
+        if not item.offsets:
+            return 0
+        return sum(int(end) - int(start) + 1 for start, end in item.offsets)
+
+    def _encode_mm_item(self, item: MultimodalDataItem) -> mx.array:
+        if item.precomputed_embeddings is not None:
+            return self._to_mx_array(
+                item.precomputed_embeddings, dtype=self._embed_tokens().weight.dtype
+            )
+        if item.feature is None:
+            raise RuntimeError(f"Multimodal {item.modality.name} item has no feature.")
+
+        if item.is_image():
+            grid_key = "image_grid_thw"
+        elif item.is_video():
+            grid_key = "video_grid_thw"
+        else:
+            raise RuntimeError(
+                f"SGLang MLX multimodal does not support {item.modality.name} inputs."
+            )
+
+        grid = item.model_specific_data.get(grid_key)
+        if grid is None:
+            raise RuntimeError(
+                f"Multimodal {item.modality.name} item missing {grid_key}."
+            )
+
+        pixel_values = self._to_mx_array(item.feature, dtype=self._vision_dtype())
+        grid_thw = self._to_mx_array(grid, dtype=mx.int32)
+        if len(grid_thw.shape) == 1:
+            grid_thw = grid_thw[None, :]
+
+        output = self.vl_model.vision_tower(pixel_values, grid_thw)
+        embeds = output[0] if isinstance(output, tuple) else output
+        return embeds.astype(self._embed_tokens().weight.dtype)
+
+    def _build_multimodal_input_embeds(
+        self,
+        token_ids: list[int],
+        mm_inputs: MultimodalInputs | None,
+        prefix_len: int,
+    ) -> tuple[mx.array | None, mx.array | None]:
+        if not self.enable_multimodal or mm_inputs is None:
+            return None, None
+
+        input_ids = self._clamped_token_array(token_ids)
+        input_embeds = self._embed_tokens()(input_ids)
+
+        slice_start = prefix_len
+        slice_end = prefix_len + len(token_ids)
+        used_mm = False
+
+        for item in mm_inputs.mm_items:
+            if item is None or not item.is_valid() or not item.offsets:
+                continue
+            if item.is_audio():
+                raise RuntimeError("SGLang MLX multimodal does not support audio.")
+            if not any(
+                max(int(start), slice_start) < min(int(end) + 1, slice_end)
+                for start, end in item.offsets
+            ):
+                continue
+
+            item_embeds = self._encode_mm_item(item)
+            expected_len = self._item_token_len(item)
+            if int(item_embeds.shape[0]) != expected_len:
+                raise RuntimeError(
+                    f"MLX vision embedding length mismatch for {item.modality.name}: "
+                    f"got {item_embeds.shape[0]}, expected {expected_len} from offsets."
+                )
+
+            embed_offset = 0
+            for start, end in item.offsets:
+                start = int(start)
+                end = int(end)
+                offset_len = end - start + 1
+                inter_start = max(start, slice_start)
+                inter_end = min(end + 1, slice_end)
+                if inter_start < inter_end:
+                    src_start = embed_offset + inter_start - start
+                    src_end = src_start + (inter_end - inter_start)
+                    dst_start = inter_start - slice_start
+                    dst_end = dst_start + (inter_end - inter_start)
+                    input_embeds = input_embeds.at[
+                        0, dst_start:dst_end, :
+                    ].set(item_embeds[src_start:src_end])
+                    used_mm = True
+                embed_offset += offset_len
+
+        mrope_positions = self._slice_mrope_positions(
+            mm_inputs, prefix_len, len(token_ids)
+        )
+        return (input_embeds if used_mm else None), mrope_positions
+
+    def _slice_mrope_positions(
+        self,
+        mm_inputs: MultimodalInputs | None,
+        prefix_len: int,
+        token_count: int,
+    ) -> mx.array | None:
+        if mm_inputs is None or mm_inputs.mrope_positions is None or token_count <= 0:
+            return None
+        positions = mm_inputs.mrope_positions[:, prefix_len : prefix_len + token_count]
+        if positions.numel() == 0:
+            return None
+        return self._to_mx_array(positions, dtype=mx.int32)
+
+    def _mrope_delta(self, mm_inputs: MultimodalInputs | None) -> mx.array | None:
+        if mm_inputs is None or mm_inputs.mrope_position_delta is None:
+            return None
+        delta = self._to_mx_array(mm_inputs.mrope_position_delta, dtype=mx.int32)
+        return delta.reshape(-1)[0]
+
+    def _decode_mrope_positions(self, req_id: str) -> mx.array | None:
+        delta = self._req_mrope_position_delta.get(req_id)
+        if delta is None:
+            return None
+        seq_len = len(self._req_token_ids[req_id])
+        return mx.broadcast_to(delta - 1 + seq_len, (3, 1)).astype(mx.int32)
+
+    def _call_model(
+        self,
+        input_ids: mx.array,
+        cache: list[Any],
+        *,
+        input_embeds: mx.array | None = None,
+        mrope_positions: mx.array | None = None,
+    ):
+        if mrope_positions is not None:
+            self.model._position_ids = mrope_positions
+            self.model._rope_deltas = None
+        else:
+            self.model._position_ids = None
+            self.model._rope_deltas = None
+        try:
+            if input_embeds is not None:
+                return self.model(input_ids, inputs_embeds=input_embeds, cache=cache)
+            return self.model(input_ids, cache=cache)
+        finally:
+            self.model._position_ids = None
+            self.model._rope_deltas = None
 
     def _attention_module_for_layer(self, layer_idx: int) -> Any:
         attn = getattr(
@@ -600,6 +859,8 @@ class MlxModelRunner:
         new_slot_ids: list[int],
         req_pool_idx: int,
         req: Any | None = None,
+        mm_inputs: MultimodalInputs | None = None,
+        extend_prefix_len: int | None = None,
     ) -> int:
         """Prefill a request.  Returns next_token_id."""
         pending = self.prefill_start(
@@ -610,6 +871,8 @@ class MlxModelRunner:
             new_slot_ids=new_slot_ids,
             req_pool_idx=req_pool_idx,
             req=req,
+            mm_inputs=mm_inputs,
+            extend_prefix_len=extend_prefix_len,
         )
         self._eval_with_cache(pending.lazy_token, pending.cache)
         return self.prefill_finalize(pending)
@@ -619,9 +882,10 @@ class MlxModelRunner:
         req_id: str,
         new_token_ids: list[int],
         new_slot_ids: list[int],
+        mm_inputs: MultimodalInputs | None = None,
     ) -> int:
         """Continue prefill for a chunked request.  Returns next_token_id."""
-        pending = self.extend_start(req_id, new_token_ids, new_slot_ids)
+        pending = self.extend_start(req_id, new_token_ids, new_slot_ids, mm_inputs)
         self._eval_with_cache(pending.lazy_token, self._req_caches[req_id])
         return self.extend_finalize(pending)
 
@@ -706,6 +970,8 @@ class MlxModelRunner:
         new_slot_ids: list[int],
         req_pool_idx: int,
         req: Any | None = None,
+        mm_inputs: MultimodalInputs | None = None,
+        extend_prefix_len: int | None = None,
     ) -> MlxPendingPrefill:
         """Queue a prefill forward pass without evaluating.
 
@@ -717,11 +983,25 @@ class MlxModelRunner:
         prefix_len = len(prefix_slot_ids)
         if req is not None:
             req.mamba_last_track_seqlen = None
+        if self.enable_multimodal and mm_inputs is not None:
+            prefix_len = (
+                len(prefix_slot_ids)
+                if extend_prefix_len is None
+                else extend_prefix_len
+            )
 
         if self.disable_radix_cache:
             cache = self._acquire_cache()
-            input_ids = mx.array([new_token_ids], dtype=mx.int32)
-            model_output = self.model(input_ids, cache=cache)
+            input_embeds, mrope_positions = self._build_multimodal_input_embeds(
+                new_token_ids, mm_inputs, prefix_len
+            )
+            input_ids = self._forward_token_array(new_token_ids, input_embeds)
+            model_output = self._call_model(
+                input_ids,
+                cache,
+                input_embeds=input_embeds,
+                mrope_positions=mrope_positions,
+            )
             logits = self._extract_logits(model_output)
             lazy_token = mx.argmax(logits[:, -1, :], axis=-1)
             return MlxPendingPrefill(
@@ -731,6 +1011,7 @@ class MlxModelRunner:
                 full_token_ids=list(full_token_ids),
                 req_pool_idx=req_pool_idx,
                 synced_offset=0,
+                mrope_position_delta=self._mrope_delta(mm_inputs),
             )
 
         assert self._attention_kv_pool is not None
@@ -759,8 +1040,19 @@ class MlxModelRunner:
                 # full-prompt fallback for that edge while still syncing newly
                 # allocated attention KV below.
                 cache = self._acquire_cache()
-                input_ids = mx.array([full_token_ids or new_token_ids], dtype=mx.int32)
-                model_output = self.model(input_ids, cache=cache)
+                fallback_token_ids = full_token_ids or new_token_ids
+                input_embeds, mrope_positions = self._build_multimodal_input_embeds(
+                    fallback_token_ids, mm_inputs, 0
+                )
+                input_ids = self._forward_token_array(
+                    fallback_token_ids, input_embeds
+                )
+                model_output = self._call_model(
+                    input_ids,
+                    cache,
+                    input_embeds=input_embeds,
+                    mrope_positions=mrope_positions,
+                )
                 logits = self._extract_logits(model_output)
                 lazy_token = mx.argmax(logits[:, -1, :], axis=-1)
                 if new_slot_ids:
@@ -772,6 +1064,7 @@ class MlxModelRunner:
                     full_token_ids=list(full_token_ids),
                     req_pool_idx=req_pool_idx,
                     synced_offset=prefix_len + len(new_slot_ids),
+                    mrope_position_delta=self._mrope_delta(mm_inputs),
                 )
         else:
             cache = self._acquire_cache()
@@ -780,8 +1073,17 @@ class MlxModelRunner:
         if new_token_count > 0:
             track_new_count = track_len - prefix_len if track_len is not None else None
             if track_new_count is not None and 0 < track_new_count < new_token_count:
-                input_ids = mx.array([new_token_ids[:track_new_count]], dtype=mx.int32)
-                self.model(input_ids, cache=cache)
+                track_tokens = new_token_ids[:track_new_count]
+                input_embeds, mrope_positions = self._build_multimodal_input_embeds(
+                    track_tokens, mm_inputs, prefix_len
+                )
+                input_ids = self._forward_token_array(track_tokens, input_embeds)
+                self._call_model(
+                    input_ids,
+                    cache,
+                    input_embeds=input_embeds,
+                    mrope_positions=mrope_positions,
+                )
                 self._store_tracked_auxiliary_state(req, cache, track_len)
                 if pool_backed_attention:
                     cache = self._materialize_pool_backed_attention(cache)
@@ -795,8 +1097,23 @@ class MlxModelRunner:
             for c in cache:
                 c.offset = max(c.offset - 1, 0)
 
-        input_ids = mx.array([extend_tokens], dtype=mx.int32)
-        model_output = self.model(input_ids, cache=cache)
+        extend_prefix = (
+            prefix_len + track_new_count
+            if new_token_count > 0
+            and track_len is not None
+            and 0 < (track_len - prefix_len) < new_token_count
+            else prefix_len
+        )
+        input_embeds, mrope_positions = self._build_multimodal_input_embeds(
+            extend_tokens, mm_inputs, extend_prefix
+        )
+        input_ids = self._forward_token_array(extend_tokens, input_embeds)
+        model_output = self._call_model(
+            input_ids,
+            cache,
+            input_embeds=input_embeds,
+            mrope_positions=mrope_positions,
+        )
         logits = self._extract_logits(model_output)
 
         if track_len is not None and track_len == prefix_len + new_token_count:
@@ -821,6 +1138,7 @@ class MlxModelRunner:
             full_token_ids=list(full_token_ids),
             req_pool_idx=req_pool_idx,
             synced_offset=prefix_len + len(new_slot_ids),
+            mrope_position_delta=self._mrope_delta(mm_inputs),
         )
 
     def prefill_finalize(self, pending: MlxPendingPrefill) -> int:
@@ -837,6 +1155,12 @@ class MlxModelRunner:
         self._req_caches[pending.req_id] = pending.cache
         self._req_pool_idx[pending.req_id] = pending.req_pool_idx
         self._req_synced_offset[pending.req_id] = pending.synced_offset
+        if pending.mrope_position_delta is not None:
+            self._req_mrope_position_delta[pending.req_id] = (
+                pending.mrope_position_delta
+            )
+        else:
+            self._req_mrope_position_delta.pop(pending.req_id, None)
         self._store_auxiliary_state(pending.req_pool_idx, pending.cache)
         return next_token
 
@@ -845,6 +1169,7 @@ class MlxModelRunner:
         req_id: str,
         new_token_ids: list[int],
         new_slot_ids: list[int],
+        mm_inputs: MultimodalInputs | None = None,
     ) -> MlxPendingExtend:
         """Queue chunked-prefill continuation without evaluating."""
         assert (
@@ -853,8 +1178,17 @@ class MlxModelRunner:
 
         cache = self._req_caches[req_id]
 
-        input_ids = mx.array([new_token_ids], dtype=mx.int32)
-        model_output = self.model(input_ids, cache=cache)
+        prefix_len = max(len(self._req_token_ids.get(req_id, [])) - 1, 0)
+        input_embeds, mrope_positions = self._build_multimodal_input_embeds(
+            new_token_ids, mm_inputs, prefix_len
+        )
+        input_ids = self._forward_token_array(new_token_ids, input_embeds)
+        model_output = self._call_model(
+            input_ids,
+            cache,
+            input_embeds=input_embeds,
+            mrope_positions=mrope_positions,
+        )
         logits = self._extract_logits(model_output)
         lazy_token = mx.argmax(logits[:, -1, :], axis=-1)
 
@@ -1079,10 +1413,18 @@ class MlxModelRunner:
         self,
         caches: list[list[Any]],
         input_ids_by_request: list[mx.array],
+        req_ids: list[str] | None = None,
     ) -> mx.array:
         lazy_token_list = []
-        for input_ids, cache in zip(input_ids_by_request, caches):
-            model_output = self.model(input_ids, cache=cache)
+        for i, (input_ids, cache) in enumerate(zip(input_ids_by_request, caches)):
+            req_id = None if req_ids is None else req_ids[i]
+            model_output = self._call_model(
+                input_ids,
+                cache,
+                mrope_positions=(
+                    None if req_id is None else self._decode_mrope_positions(req_id)
+                ),
+            )
             logits = self._extract_logits(model_output)
             lazy_token_list.append(mx.argmax(logits[:, -1, :], axis=-1))
         return (
@@ -1106,7 +1448,7 @@ class MlxModelRunner:
                 AttentionOffsetCache(offset=max_offset)
                 for _ in range(self._cache_layout.num_layers)
             ]
-            model_output = self.model(batched_input, cache=shim_cache)
+            model_output = self._call_model(batched_input, shim_cache)
             logits = self._extract_logits(model_output)
             return mx.argmax(logits[:, -1, :], axis=-1)
         finally:
@@ -1142,7 +1484,16 @@ class MlxModelRunner:
         last_tokens = [self._req_token_ids[rid][-1] for rid in req_ids]
         batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
 
-        if self._cache_layout.has_auxiliary_state:
+        if self.enable_multimodal and any(
+            rid in self._req_mrope_position_delta for rid in req_ids
+        ):
+            input_ids_by_request = [
+                mx.array([[token]], dtype=mx.int32) for token in last_tokens
+            ]
+            lazy_tokens = self._decode_with_native_cache(
+                caches, input_ids_by_request, list(req_ids)
+            )
+        elif self._cache_layout.has_auxiliary_state:
             lazy_tokens = self._decode_with_hybrid_batching(
                 caches, batched_input, list(req_ids)
             )
@@ -1180,6 +1531,12 @@ class MlxModelRunner:
           before step N+1's bookkeeping.
         """
         caches = prev.caches
+        if self.enable_multimodal and any(
+            rid in self._req_mrope_position_delta for rid in prev.req_ids
+        ):
+            raise RuntimeError(
+                "Chained MLX decode is not supported for multimodal requests yet."
+            )
 
         # TODO (changminbark): Need to fix
         # ContiguousAttentionKVCache.write_token to accommodate dynamic growing
@@ -1249,6 +1606,7 @@ class MlxModelRunner:
             self._release_cache(cache)
         self._req_pool_idx.pop(req_id, None)
         self._req_synced_offset.pop(req_id, None)
+        self._req_mrope_position_delta.pop(req_id, None)
 
     def clear(self):
         """Clear all request states."""
@@ -1258,5 +1616,6 @@ class MlxModelRunner:
         self._req_caches.clear()
         self._req_pool_idx.clear()
         self._req_synced_offset.clear()
+        self._req_mrope_position_delta.clear()
         if self._attention_kv_pool is not None:
             self._attention_kv_pool.clear()

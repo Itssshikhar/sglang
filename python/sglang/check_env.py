@@ -117,7 +117,7 @@ class BaseEnv:
                 if "Hypervisor vendor:" in line:
                     return {"Hypervisor vendor:": line.split(":")[1].strip()}
             return {}
-        except:
+        except Exception:
             return {}
 
     def get_ulimit_soft(self) -> dict:
@@ -508,7 +508,7 @@ class MUSAEnv(BaseEnv):
 class MPSEnv(BaseEnv):
     """Environment checker for Apple Silicon MPS"""
 
-    EXTRA_PACKAGE_LIST = ["mlx", "mlx-lm", "mlx-metal"]
+    EXTRA_PACKAGE_LIST = ["mlx", "mlx-lm", "mlx-vlm", "mlx-metal"]
 
     def __init__(self):
         super().__init__()

@@ -1,12 +1,10 @@
 # Marlin MLX Comparison Benchmark
 
 > **Errata (2026-06-11):** see [MLX_BENCHMARK_REPORT.md](MLX_BENCHMARK_REPORT.md)
-> for actual results and required corrections to these instructions. Notably:
-> this benchmark must run on upstream sglang `main` (this branch's base has no
-> MLX backend) with `patches/sglang_main_mps_mlx_fixes.patch` applied, and the
-> SGLang MLX path currently **drops video features entirely** — its captions
-> are hallucinated. A working custom runner is provided in
-> `marlin_mlx_hybrid.py`.
+> for the pre-fix benchmark results and bring-up notes. This branch now includes
+> an experimental Marlin/Qwen3.5 MLX multimodal path; rerun the benchmark on
+> Apple Silicon to validate that SGLang captions the video instead of producing
+> the historical text-only hallucination.
 
 This benchmark compares two Apple Silicon paths for Marlin video captioning:
 
@@ -93,15 +91,20 @@ SGLANG_USE_MLX=1 python -m sglang.launch_server \
   --trust-remote-code \
   --enable-multimodal \
   --disable-cuda-graph \
+  --disable-radix-cache \
+  --disable-overlap-schedule \
   --host 0.0.0.0 \
   --port 30000 \
-  --mm-process-config '{"video":{"fps":2.0,"min_frames":4,"max_frames":240,"max_pixels":200704}}'
+  --mm-process-config '{"video":{"fps":2.0,"min_frames":4,"max_frames":240,"max_pixels":200704}}' \
+  --json-model-override-args '{"architectures":["Qwen3_5ForConditionalGeneration"]}'
 ```
 
 Useful SGLang MLX switches:
 
 - `--disable-cuda-graph`: expected for Metal/MLX.
 - `--disable-overlap-schedule`: use this for a synchronous comparison path.
+- `--disable-radix-cache`: required for the first Marlin/Qwen3.5 MLX
+  multimodal implementation.
 - `SGLANG_MLX_USE_CUSTOM_ROPE=1`: opt into the custom Metal RoPE kernel.
 - `--quantization mlx_q8`: quantize an fp16 model at load time. Do not use this
   if you are already loading an MLX 8-bit repo unless you want to test the flag's
@@ -179,6 +182,9 @@ same input, writes JSONL rows, and stops the SGLang server at the end:
 ```bash
 python benchmark/marlin_video/bench_mlx_compare.py \
   --mode both \
+  --sglang-extra-arg="--json-model-override-args '{\"architectures\":[\"Qwen3_5ForConditionalGeneration\"]}'" \
+  --sglang-extra-arg=--disable-radix-cache \
+  --sglang-extra-arg=--disable-overlap-schedule \
   --sglang-model-path junwatu/Marlin-2B-MLX-8bit \
   --custom-model-path junwatu/Marlin-2B-MLX-8bit \
   --custom-command 'python /path/to/marlin_mlx_hybrid.py --model {model_path} --video-url {video_url} --prompt {prompt} --max-tokens {max_tokens}' \
@@ -195,6 +201,8 @@ For the synchronous SGLang MLX scheduler path:
 python benchmark/marlin_video/bench_mlx_compare.py \
   --mode both \
   --disable-overlap-schedule \
+  --sglang-extra-arg="--json-model-override-args '{\"architectures\":[\"Qwen3_5ForConditionalGeneration\"]}'" \
+  --sglang-extra-arg=--disable-radix-cache \
   --sglang-model-path junwatu/Marlin-2B-MLX-8bit \
   --custom-model-path junwatu/Marlin-2B-MLX-8bit \
   --custom-callable marlin_hybrid_bench:run_once \

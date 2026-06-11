@@ -411,7 +411,17 @@ class BaseMultimodalProcessor(ABC):
         if videos:
             kwargs["videos"] = videos
             if self.video_config:
-                kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
+                # Frame-sampling/resize keys are already consumed by sglang's own
+                # preprocess_video; transformers>=5 strict typed kwargs reject
+                # unknown keys, so don't forward them to the HF processor.
+                video_config = {
+                    k: v
+                    for k, v in self.video_config.items()
+                    if k
+                    not in ("fps", "min_frames", "max_frames", "max_pixels", "min_pixels")
+                }
+                if video_config:
+                    kwargs.setdefault("videos_kwargs", {}).update(video_config)
         if audios:
             if self._processor.__class__.__name__ in {
                 "Gemma3nProcessor",
@@ -437,7 +447,11 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessor)
             and not self.server_args.disable_fast_image_processor
         ):
-            if _is_cpu or get_global_server_args().rl_on_policy_target is not None:
+            if (
+                _is_cpu
+                or not torch.cuda.is_available()  # e.g. macOS/MLX: no CUDA device
+                or get_global_server_args().rl_on_policy_target is not None
+            ):
                 kwargs["device"] = "cpu"
             elif _is_xpu:
                 kwargs["device"] = "xpu"

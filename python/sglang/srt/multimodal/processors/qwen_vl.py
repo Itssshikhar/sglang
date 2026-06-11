@@ -237,7 +237,9 @@ async def preprocess_video(
         [resized_height, resized_width],
         interpolation=InterpolationMode.BILINEAR,
     )
-    video = video.pin_memory()
+    # pin_memory only benefits CUDA H2D copies and errors on MPS torch builds
+    if torch.cuda.is_available():
+        video = video.pin_memory()
     video_metadata = {
         "fps": video_fps,
         "duration": total_frames / video_fps,
