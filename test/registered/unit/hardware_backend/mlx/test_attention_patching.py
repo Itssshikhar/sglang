@@ -126,6 +126,52 @@ class TestMlxAttentionPatching(unittest.TestCase):
         self.assertEqual(patch_model_attention(model), 1)
         self.assertIsInstance(model.layers[0].attention, MLXAttentionWrapper)
 
+    def test_rotary_emb_attention_is_supported(self):
+        model = FakeModel([FakeLayer("self_attn", FakeRotaryAttention())])
+
+        _, attrs = find_attention_layers(model)
+
+        self.assertEqual(attrs, ["self_attn"])
+        self.assertTrue(is_attention_module(model.layers[0].self_attn))
+        self.assertEqual(patch_model_attention(model), 1)
+        self.assertIsInstance(model.layers[0].self_attn, MLXAttentionWrapper)
+
+    def test_attention_wrapper_delegates_extra_kwargs_without_context(self):
+        inner = FakeRotaryAttention()
+        wrapper = MLXAttentionWrapper(inner, layer_idx=0)
+        position_ids = mx.zeros((3, 1, 1), dtype=mx.int32)
+
+        wrapper(
+            mx.zeros((1, 1, 4), dtype=mx.float32),
+            cache=None,
+            position_ids=position_ids,
+            target_verify=True,
+        )
+
+        self.assertIs(inner.last_kwargs["position_ids"], position_ids)
+        self.assertTrue(inner.last_kwargs["target_verify"])
+
+    def test_batched_decode_uses_rotary_emb_apply_rotary(self):
+        inner = FakeRotaryAttention()
+        wrapper = MLXAttentionWrapper(inner, layer_idx=0)
+        cache = ContiguousAttentionKVCache(
+            n_kv_heads=1, head_dim=2, max_seq_len=4, dtype=mx.float32
+        )
+        ctx = BatchedDecodeContext(
+            batch_size=1,
+            seq_lens=[2],
+            attention_layer_caches=[[cache]],
+        )
+
+        out = wrapper._batched_decode(mx.zeros((1, 1, 4), dtype=mx.float32), ctx)
+        mx.eval(out)
+
+        self.assertEqual(out.shape, (1, 1, 4))
+        self.assertEqual(
+            inner.rotary_emb.last_position_ids.tolist(),
+            [[[2]], [[2]], [[2]]],
+        )
+
     def test_aot_rope_kernel_build_uses_head_aliases(self):
         attn = FakeAttention(use_aliases=True)
         attn.rope = SimpleNamespace(dims=2, traditional=False, base=10000.0)
@@ -1326,6 +1372,35 @@ if _HAS_MLX:
             self.v_proj = FakeProjection(2)
             self.o_proj = FakeProjection(4)
             self.rope = lambda x, offset=None: x
+
+    class FakeRotaryEmbedding:
+        def __init__(self):
+            self.last_position_ids = None
+
+        def apply_rotary(self, queries, keys, position_ids, unsqueeze_dim=1):
+            self.last_position_ids = position_ids
+            self.last_unsqueeze_dim = unsqueeze_dim
+            return queries, keys
+
+    class FakeRotaryAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_attention_heads = 2
+            self.num_key_value_heads = 1
+            self.head_dim = 2
+            self.scale = self.head_dim**-0.5
+            self.q_proj = FakeProjection(8)
+            self.k_proj = FakeProjection(2)
+            self.v_proj = FakeProjection(2)
+            self.o_proj = FakeProjection(4)
+            self.q_norm = IdentityNorm()
+            self.k_norm = IdentityNorm()
+            self.rotary_emb = FakeRotaryEmbedding()
+            self.last_kwargs = None
+
+        def __call__(self, x, mask=None, cache=None, **kwargs):
+            self.last_kwargs = kwargs
+            return mx.zeros((*x.shape[:-1], 4), dtype=x.dtype)
 
     class ProjectionOnlyMixer(nn.Module):
         def __init__(self):

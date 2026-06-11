@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -127,13 +128,31 @@ class MLXAttentionWrapper(nn.Module):
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "_layer_idx", layer_idx)
 
-    def __call__(self, x: mx.array, mask: Any = None, cache: Any = None) -> mx.array:
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Any = None,
+        cache: Any = None,
+        **kwargs,
+    ) -> mx.array:
         ctx = get_context()
         if ctx is None:
-            return self._inner(x, mask=mask, cache=cache)
-        return self._batched_decode(x, ctx)
+            return self._inner(x, mask=mask, cache=cache, **kwargs)
+        return self._batched_decode(
+            x,
+            ctx,
+            position_ids=kwargs.get("position_ids"),
+            position_embeddings=kwargs.get("position_embeddings"),
+        )
 
-    def _batched_decode(self, x: mx.array, ctx: BatchedDecodeContext) -> mx.array:
+    def _batched_decode(
+        self,
+        x: mx.array,
+        ctx: BatchedDecodeContext,
+        *,
+        position_ids: mx.array | None = None,
+        position_embeddings: tuple[mx.array, mx.array] | None = None,
+    ) -> mx.array:
         inner = self._inner
         layer_idx = self._layer_idx
         B = ctx.batch_size
@@ -183,7 +202,7 @@ class MLXAttentionWrapper(nn.Module):
         offsets = ctx.offsets
         attention_pool_idx = ctx.attention_pool_index_by_layer[layer_idx]
 
-        if ctx.aot.rope is not None:
+        if ctx.aot.rope is not None and hasattr(inner, "rope"):
             # AOT path: real .metallib RoPE + fused KV pool scatter.
             queries, keys = self._rope_custom_aot(
                 queries,
@@ -194,10 +213,14 @@ class MLXAttentionWrapper(nn.Module):
                 ctx.aot.rope,
             )
         else:
-            # Fallback: MLX's built-in mx.fast.rope (used when the AOT kernel
-            # isn't built or the model uses an unsupported RoPE variant).
-            queries = inner.rope(queries, offset=offsets)
-            keys = inner.rope(keys, offset=offsets)
+            queries, keys = self._apply_rotary(
+                inner,
+                queries,
+                keys,
+                offsets,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )
 
         layer_caches = ctx.attention_layer_caches[attention_pool_idx]
         pad_sizes = ctx.pad_sizes
@@ -243,6 +266,65 @@ class MLXAttentionWrapper(nn.Module):
         if gate is not None:
             output = output * mx.sigmoid(gate)
         return inner.o_proj(output)
+
+    @staticmethod
+    def _decode_position_ids(
+        offsets: mx.array,
+        query_len: int,
+        batch_size: int,
+    ) -> mx.array:
+        positions = offsets[None, :, None] + mx.arange(query_len, dtype=mx.int32)[
+            None,
+            None,
+            :,
+        ]
+        return mx.broadcast_to(positions, (3, batch_size, query_len))
+
+    @staticmethod
+    def _apply_rotary(
+        inner: nn.Module,
+        queries: mx.array,
+        keys: mx.array,
+        offsets: mx.array,
+        *,
+        position_ids: mx.array | None = None,
+        position_embeddings: tuple[mx.array, mx.array] | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        rope = getattr(inner, "rope", None)
+        if rope is not None:
+            return rope(queries, offset=offsets), rope(keys, offset=offsets)
+
+        rotary_emb = getattr(inner, "rotary_emb", None)
+        if rotary_emb is None:
+            raise RuntimeError(
+                f"Cannot apply RoPE for {type(inner).__name__}: "
+                "missing rope/rotary_emb."
+            )
+
+        if position_embeddings is not None:
+            apply_fn = getattr(
+                sys.modules.get(inner.__class__.__module__),
+                "apply_multimodal_rotary_pos_emb",
+                None,
+            )
+            if callable(apply_fn):
+                cos, sin = position_embeddings
+                return apply_fn(queries, keys, cos, sin)
+
+        if position_ids is None:
+            position_ids = MLXAttentionWrapper._decode_position_ids(
+                offsets,
+                int(queries.shape[2]),
+                int(queries.shape[0]),
+            )
+
+        apply_rotary = getattr(rotary_emb, "apply_rotary", None)
+        if not callable(apply_rotary):
+            raise RuntimeError(
+                f"Cannot apply rotary_emb for {type(inner).__name__}: "
+                "rotary_emb has no apply_rotary()."
+            )
+        return apply_rotary(queries, keys, position_ids, unsqueeze_dim=1)
 
     @staticmethod
     def _rope_custom_aot(

@@ -61,6 +61,7 @@ def build_sglang_command(args: argparse.Namespace) -> list[str]:
             args.sglang_server_command,
             {
                 "model_path": args.sglang_model_path,
+                "tokenizer_path": args.sglang_tokenizer_path or args.sglang_model_path,
                 "served_model_name": args.sglang_model,
                 "host": args.sglang_host,
                 "port": args.sglang_port,
@@ -86,6 +87,8 @@ def build_sglang_command(args: argparse.Namespace) -> list[str]:
         "--mm-process-config",
         args.mm_process_config,
     ]
+    if args.sglang_tokenizer_path:
+        cmd.extend(["--tokenizer-path", args.sglang_tokenizer_path])
     if args.disable_overlap_schedule:
         cmd.append("--disable-overlap-schedule")
     if args.sglang_quantization:
@@ -515,6 +518,13 @@ def main() -> None:
     )
 
     parser.add_argument("--sglang-model-path", default="junwatu/Marlin-2B-MLX-8bit")
+    parser.add_argument(
+        "--sglang-tokenizer-path",
+        help=(
+            "Optional tokenizer/processor repo for SGLang. For Marlin MLX "
+            "8-bit weights, use NemoStation/Marlin-2B."
+        ),
+    )
     parser.add_argument("--sglang-model", default="default")
     parser.add_argument("--sglang-host", default="0.0.0.0")
     parser.add_argument("--sglang-port", type=int, default=30000)
@@ -527,7 +537,8 @@ def main() -> None:
         "--sglang-server-command",
         help=(
             "Override server launch command. Supports placeholders: {model_path}, "
-            "{served_model_name}, {host}, {port}, {mm_process_config}."
+            "{tokenizer_path}, {served_model_name}, {host}, {port}, "
+            "{mm_process_config}."
         ),
     )
     parser.add_argument(

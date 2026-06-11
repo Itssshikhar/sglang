@@ -103,6 +103,21 @@ fix should first make processor loading work for the MLX checkpoint or document
 MLX attention discovery/wrapper to `mlx_vlm`'s Qwen3.5 API without breaking
 multimodal RoPE semantics.
 
+Follow-up fix on this branch:
+
+- The benchmark launcher and smoke-test docs now use
+  `--sglang-tokenizer-path NemoStation/Marlin-2B` for the HF processor while
+  keeping `junwatu/Marlin-2B-MLX-8bit` as the MLX weight repo.
+- SGLang's MLX attention discovery now accepts softmax attention modules that
+  expose `rotary_emb` instead of `rope`.
+- `MLXAttentionWrapper` now forwards `position_ids`, `position_embeddings`, and
+  other attention kwargs when no batched context is active, and its batched
+  decode path can apply `rotary_emb.apply_rotary(...)` with synthesized M-RoPE
+  decode positions.
+- This follow-up was validated locally with compile/lint checks and a focused
+  `mlx[cuda12]` helper smoke. It still needs the Apple Silicon accuracy smoke
+  to prove full request-level correctness and caption grounding.
+
 ## TL;DR
 
 | | SGLang MLX server | Custom MLX hybrid |

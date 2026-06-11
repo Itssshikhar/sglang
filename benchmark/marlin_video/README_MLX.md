@@ -88,6 +88,7 @@ SGLang's Apple backend is selected with `SGLANG_USE_MLX=1`, not with a
 ```bash
 SGLANG_USE_MLX=1 python -m sglang.launch_server \
   --model-path junwatu/Marlin-2B-MLX-8bit \
+  --tokenizer-path NemoStation/Marlin-2B \
   --served-model-name default \
   --trust-remote-code \
   --enable-multimodal \
@@ -116,20 +117,17 @@ Useful SGLang MLX switches:
 Run this before collecting throughput numbers. The first pass should answer one
 question only: does the SGLang MLX caption describe the actual video?
 
-Current status on this branch, tested 2026-06-11: this command fails during
-server startup before any request is sent. `AutoProcessor` rejects
-`junwatu/Marlin-2B-MLX-8bit` with an "Unrecognized image processor" error. A
-workaround that passes `--tokenizer-path NemoStation/Marlin-2B` gets past
-processor loading and loads the MLX model, but then fails while patching the
-MLX KV-cache attention path because the installed `mlx_vlm` Qwen3.5 attention
-module exposes `rotary_emb`, while SGLang's MLX attention wrapper expects a
-`rope` attribute. Do not collect throughput numbers until this smoke test
-actually produces a semantically grounded caption.
+The MLX 8-bit repo contains the weights, but its HF processor metadata is not
+usable by `AutoProcessor`. Use `NemoStation/Marlin-2B` as the tokenizer and
+processor source while loading `junwatu/Marlin-2B-MLX-8bit` as the SGLang model
+path. Do not collect throughput numbers until this smoke test actually
+produces a semantically grounded caption.
 
 ```bash
 python benchmark/marlin_video/bench_mlx_compare.py \
   --mode sglang-mlx \
   --sglang-model-path junwatu/Marlin-2B-MLX-8bit \
+  --sglang-tokenizer-path NemoStation/Marlin-2B \
   --sglang-extra-arg="--json-model-override-args '{\"architectures\":[\"Qwen3_5ForConditionalGeneration\"]}'" \
   --sglang-extra-arg=--disable-radix-cache \
   --disable-overlap-schedule \
@@ -232,6 +230,7 @@ python benchmark/marlin_video/bench_mlx_compare.py \
   --sglang-extra-arg=--disable-radix-cache \
   --sglang-extra-arg=--disable-overlap-schedule \
   --sglang-model-path junwatu/Marlin-2B-MLX-8bit \
+  --sglang-tokenizer-path NemoStation/Marlin-2B \
   --custom-model-path junwatu/Marlin-2B-MLX-8bit \
   --custom-command 'python /path/to/marlin_mlx_hybrid.py --model {model_path} --video-url {video_url} --prompt {prompt} --max-tokens {max_tokens}' \
   --video-url https://github.com/sgl-project/sgl-test-files/raw/refs/heads/main/videos/jobs_presenting_ipod.mp4 \
@@ -250,6 +249,7 @@ python benchmark/marlin_video/bench_mlx_compare.py \
   --sglang-extra-arg="--json-model-override-args '{\"architectures\":[\"Qwen3_5ForConditionalGeneration\"]}'" \
   --sglang-extra-arg=--disable-radix-cache \
   --sglang-model-path junwatu/Marlin-2B-MLX-8bit \
+  --sglang-tokenizer-path NemoStation/Marlin-2B \
   --custom-model-path junwatu/Marlin-2B-MLX-8bit \
   --custom-callable marlin_hybrid_bench:run_once \
   --warmup 1 \

@@ -221,9 +221,12 @@ def get_processor(
                 revision=revision,
                 **kwargs,
             )
-        elif "Unrecognized feature extractor" in error_message:
+        elif (
+            "Unrecognized feature extractor" in error_message
+            or "Unrecognized image processor" in error_message
+        ):
             logger.info(
-                "AutoProcessor failed on feature extractor for %s, "
+                "AutoProcessor failed on multimodal processor metadata for %s, "
                 "constructing processor manually",
                 tokenizer_name,
             )

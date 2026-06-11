@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
-# ``rope`` and ``scale`` are required by MLXAttentionWrapper. Keeping them in
-# the contract also prevents recurrent mixers such as DeltaNet from being
-# mistaken for softmax attention just because they expose projection layers.
-ATTENTION_API_ATTRS = ("q_proj", "k_proj", "v_proj", "o_proj", "rope", "scale")
+# ``scale`` and a rotary module are required by MLXAttentionWrapper. Keeping
+# them in the contract also prevents recurrent mixers such as DeltaNet from
+# being mistaken for softmax attention just because they expose projections.
+ATTENTION_API_ATTRS = ("q_proj", "k_proj", "v_proj", "o_proj", "scale")
+ROTARY_ATTRS = ("rope", "rotary_emb")
 NUM_HEAD_ATTRS = ("n_heads", "num_heads", "num_attention_heads")
 NUM_KV_HEAD_ATTRS = ("n_kv_heads", "num_k_heads", "num_kv_heads", "num_key_value_heads")
 SLIDING_ATTENTION_ATTRS = (
@@ -25,6 +26,10 @@ def first_present_attr(module: Any, names: Iterable[str]) -> Any | None:
         if hasattr(module, name):
             return getattr(module, name)
     return None
+
+
+def get_rotary_module(module: Any) -> Any | None:
+    return first_present_attr(module, ROTARY_ATTRS)
 
 
 def get_num_heads(module: Any) -> int | None:
@@ -53,6 +58,7 @@ def get_head_dim(module: Any) -> int | None:
 def is_attention_module(module: Any) -> bool:
     return (
         all(hasattr(module, attr) for attr in ATTENTION_API_ATTRS)
+        and get_rotary_module(module) is not None
         and get_num_heads(module) is not None
         and get_num_kv_heads(module) is not None
     )
