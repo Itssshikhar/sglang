@@ -660,10 +660,12 @@ class MlxModelRunner:
                     src_start = embed_offset + inter_start - start
                     src_end = src_start + (inter_end - inter_start)
                     dst_start = inter_start - slice_start
-                    dst_end = dst_start + (inter_end - inter_start)
-                    input_embeds = input_embeds.at[
-                        0, dst_start:dst_end, :
-                    ].set(item_embeds[src_start:src_end])
+                    input_embeds = mx.slice_update(
+                        input_embeds,
+                        item_embeds[src_start:src_end][None, :, :],
+                        start_indices=mx.array([0, dst_start, 0], dtype=mx.int32),
+                        axes=(0, 1, 2),
+                    )
                     used_mm = True
                 embed_offset += offset_len
 
