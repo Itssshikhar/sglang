@@ -110,6 +110,41 @@ Useful SGLang MLX switches:
   if you are already loading an MLX 8-bit repo unless you want to test the flag's
   no-op behavior on pre-quantized weights.
 
+## Accuracy Smoke Test
+
+Run this before collecting throughput numbers. The first pass should answer one
+question only: does the SGLang MLX caption describe the actual video?
+
+```bash
+python benchmark/marlin_video/bench_mlx_compare.py \
+  --mode sglang-mlx \
+  --sglang-model-path junwatu/Marlin-2B-MLX-8bit \
+  --sglang-extra-arg="--json-model-override-args '{\"architectures\":[\"Qwen3_5ForConditionalGeneration\"]}'" \
+  --sglang-extra-arg=--disable-radix-cache \
+  --disable-overlap-schedule \
+  --video-url https://github.com/sgl-project/sgl-test-files/raw/refs/heads/main/videos/jobs_presenting_ipod.mp4 \
+  --prompt "Describe the video. Include visible people, objects, scene layout, and any time-ranged events." \
+  --max-tokens 256 \
+  --warmup 0 \
+  --runs 1 \
+  --output benchmark/marlin_video/accuracy_smoke_sglang_mlx.jsonl
+```
+
+Inspect the generated text:
+
+```bash
+tail -n 1 benchmark/marlin_video/accuracy_smoke_sglang_mlx.jsonl | python -m json.tool
+```
+
+For the bundled `jobs_presenting_ipod.mp4` clip, treat the run as a failure if
+the caption does not clearly mention a stage/keynote-style presentation with a
+speaker and a handheld/product demo context. Do not compare tokens/sec until
+this passes. Exact wording is not important; semantic grounding is.
+
+For a stricter check, run `--mode both` with the custom hybrid path and compare
+the two captions side by side. They do not need to match, but they should agree
+on the main scene and events.
+
 ## Custom MLX Hybrid Path
 
 The comparison script supports two adapters.
