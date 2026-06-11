@@ -63,6 +63,70 @@ Validation:
 - The README SGLang MLX accuracy smoke passed semantically on the bundled
   Jobs/iPod video.
 
+## Fixed-branch comparison against custom MLX hybrid (2026-06-11)
+
+After the smoke fix, the comparison harness was rerun with one warmup and five
+measured samples for each backend on the project-owned fixture
+`jobs_presenting_ipod.mp4`. The `sgl-project/sgl-test-files` video directory
+currently contains only this one video, so these are repeated samples of the
+same clip, not five independent clips.
+
+Command shape:
+
+```bash
+sglang-metal/bin/python benchmark/marlin_video/bench_mlx_compare.py \
+  --mode both \
+  --disable-overlap-schedule \
+  --sglang-model-path junwatu/Marlin-2B-MLX-8bit \
+  --sglang-tokenizer-path NemoStation/Marlin-2B \
+  --sglang-extra-arg="--json-model-override-args '{\"architectures\":[\"Qwen3_5ForConditionalGeneration\"]}'" \
+  --sglang-extra-arg=--disable-radix-cache \
+  --custom-model-path junwatu/Marlin-2B-MLX-8bit \
+  --custom-command 'sglang-metal/bin/python benchmark/marlin_video/marlin_mlx_hybrid.py --model {model_path} --video-url {video_url} --prompt {prompt} --max-tokens {max_tokens} --temperature {temperature}' \
+  --video-url https://github.com/sgl-project/sgl-test-files/raw/refs/heads/main/videos/jobs_presenting_ipod.mp4 \
+  --max-tokens 384 \
+  --warmup 1 \
+  --runs 5 \
+  --output benchmark/marlin_video/mlx_compare_postfix_jobs_20260611.jsonl
+```
+
+Result: both backends produced deterministic, semantically grounded captions
+for all measured rows. No request failed.
+
+| Backend | Samples | Mean elapsed | Median elapsed | Min / max elapsed | Completion tok/s mean |
+|---|---:|---:|---:|---:|---:|
+| SGLang MLX server | 5 | 27.01 s | 27.53 s | 25.35 / 27.82 s | 13.83 |
+| Custom MLX hybrid CLI | 5 | 75.04 s | 75.08 s | 72.40 / 77.82 s | 3.69 |
+
+Mean elapsed ratio:
+
+- SGLang MLX / custom MLX hybrid: `0.36x`
+- Custom MLX hybrid / SGLang MLX: `2.78x`
+
+Critical caveats:
+
+- The custom path is the existing CLI adapter, not a resident service. Every
+  custom measured row starts a fresh Python process and reloads the HF model
+  used for M-RoPE preparation plus the MLX model. Treat the custom numbers as
+  cold end-to-end latency, not steady-state generation throughput.
+- The SGLang path keeps a server and model resident across rows. This is the
+  serving mode we care about, but it is not process-lifecycle equivalent to the
+  current custom CLI.
+- Prompt/accounting differs: SGLang reported `3251` prompt tokens and `373`
+  completion tokens; the custom hybrid reported `9983` prompt tokens and `277`
+  completion tokens. This makes total-token throughput especially non-comparable.
+  Completion-token throughput is directionally useful, but still includes
+  prefill, preprocessing, and custom model-load time.
+- SGLang prefill slowed after custom subprocesses ran concurrently on the same
+  machine, which is visible in the higher 27 s fixed-branch comparison latency
+  versus the earlier 15 s one-shot smoke at `--max-tokens 256`.
+
+Caption agreement:
+
+- SGLang: described a keynote-style stage presentation with a speaker and
+  close-up shots of a silver iPod-style device.
+- Custom hybrid: described the same stage/product-demo scene and device context.
+
 ## Earlier branch smoke result before follow-up fixes (2026-06-11)
 
 Branch tested: `marlin-mlx-mm-support` at `5e14f1d021` (`Use MLX
