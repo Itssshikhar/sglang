@@ -141,6 +141,82 @@ Follow-up benchmark harness change:
   resident-server-vs-CLI latency, not as isolated MLX kernel or inference-engine
   speed.
 
+## Instrumented fixed-branch comparison (2026-06-11)
+
+After pulling `894aa80351` (`Instrument Marlin MLX comparison benchmark`), the
+instrumented comparison was run with SGLang streaming enabled so the harness
+could record time-to-first-token and post-TTFT throughput. The custom MLX path
+used the included CLI runner so its component timings expose the cost of the
+published hybrid recipe rather than a resident custom service.
+
+Command shape:
+
+```bash
+sglang-metal/bin/python benchmark/marlin_video/bench_mlx_compare.py \
+  --mode both \
+  --sglang-stream \
+  --disable-overlap-schedule \
+  --sglang-model-path junwatu/Marlin-2B-MLX-8bit \
+  --sglang-tokenizer-path NemoStation/Marlin-2B \
+  --sglang-extra-arg="--json-model-override-args '{\"architectures\":[\"Qwen3_5ForConditionalGeneration\"]}'" \
+  --sglang-extra-arg=--disable-radix-cache \
+  --custom-model-path junwatu/Marlin-2B-MLX-8bit \
+  --custom-command 'sglang-metal/bin/python benchmark/marlin_video/marlin_mlx_hybrid.py --model {model_path} --video-url {video_url} --prompt {prompt} --max-tokens {max_tokens} --temperature {temperature}' \
+  --video-url https://github.com/sgl-project/sgl-test-files/raw/refs/heads/main/videos/jobs_presenting_ipod.mp4 \
+  --max-tokens 384 \
+  --warmup 1 \
+  --runs 5 \
+  --output benchmark/marlin_video/mlx_compare_instrumented_jobs_20260611.jsonl
+```
+
+The JSONL contained one `sglang_server_start` row and twelve request rows
+(one warmup plus five measured rows per backend). There were no request
+failures, and both backends again produced deterministic, semantically grounded
+captions for the Jobs/iPod stage presentation.
+
+| Backend | Samples | Mean elapsed | Mean TTFT | Mean completion tok/s | Decode/post-TTFT tok/s |
+|---|---:|---:|---:|---:|---:|
+| SGLang MLX streamed | 5 | 27.15 s | 18.05 s | 13.76 | 40.91 |
+| Custom MLX hybrid CLI | 5 | 76.96 s | 68.38 s | 3.61 | 37.75 |
+
+SGLang startup was recorded separately as `38.13 s` and excluded from the
+request means. The elapsed mean ratio was `0.35x` for SGLang/custom, or `2.84x`
+for custom/SGLang.
+
+Custom component timing means:
+
+| Component | Mean |
+|---|---:|
+| HF processor load | 23.01 s |
+| MLX prefill | 19.40 s |
+| MLX vision encode | 13.79 s |
+| MLX decode | 7.34 s |
+| HF model load | 5.83 s |
+| Imports | 2.90 s |
+| MLX model load | 2.71 s |
+| Video fetch | 0.31 s |
+| HF processor apply | 0.22 s |
+| MLX input conversion | 0.07 s |
+| MLX text embedding | 0.07 s |
+| MLX embedding merge | 0.05 s |
+| Token decode | 0.02 s |
+| M-RoPE compute | 0.002 s |
+
+Critical interpretation:
+
+- The end-to-end SGLang advantage in this run is mostly setup and prefill, not
+  raw decode. Once past TTFT, SGLang streamed at about `40.91 tok/s`; the
+  custom CLI's measured MLX decode loop was about `37.75 tok/s`.
+- The custom CLI spends most of its wall time before decode: HF processor/model
+  setup, MLX prefill, and vision encoding dominate the run.
+- Prompt/token accounting remains different (`3251` prompt / `373` completion
+  tokens for SGLang, `9983` prompt / `277` completion tokens for custom), so
+  total-token throughput is not a reliable fairness metric.
+- A SGLang scheduler child printed an `exit code -9` and fatal Python shutdown
+  message after the benchmark had written all rows and exited successfully. No
+  server or benchmark process remained afterward, but the cleanup path should
+  not be treated as clean.
+
 ## Earlier branch smoke result before follow-up fixes (2026-06-11)
 
 Branch tested: `marlin-mlx-mm-support` at `5e14f1d021` (`Use MLX
