@@ -1,11 +1,11 @@
 # Marlin MLX Comparison Benchmark
 
 > **Errata (2026-06-11):** see [MLX_BENCHMARK_REPORT.md](MLX_BENCHMARK_REPORT.md)
-> for the pre-fix benchmark results and bring-up notes. This branch now includes
-> an experimental Marlin/Qwen3.5 MLX multimodal path, but the accuracy smoke
-> test currently does not reach generation on the tested Apple Silicon stack.
-> The current branch result and blockers are documented in the report before
-> the historical benchmark notes.
+> for the pre-fix benchmark results, bring-up notes, and the latest branch
+> smoke result. This branch now includes an experimental Marlin/Qwen3.5 MLX
+> multimodal path that passes the bundled SGLang MLX accuracy smoke on the
+> tested Apple Silicon stack when run with the documented tokenizer/processor
+> split and `--disable-radix-cache --disable-overlap-schedule`.
 
 This benchmark compares two Apple Silicon paths for Marlin video captioning:
 

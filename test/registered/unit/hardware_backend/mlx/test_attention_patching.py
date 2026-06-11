@@ -135,6 +135,10 @@ class TestMlxAttentionPatching(unittest.TestCase):
         self.assertTrue(is_attention_module(model.layers[0].self_attn))
         self.assertEqual(patch_model_attention(model), 1)
         self.assertIsInstance(model.layers[0].self_attn, MLXAttentionWrapper)
+        self.assertIs(
+            model.layers[0].self_attn.rotary_emb,
+            model.layers[0].self_attn._inner.rotary_emb,
+        )
 
     def test_attention_wrapper_delegates_extra_kwargs_without_context(self):
         inner = FakeRotaryAttention()
@@ -258,6 +262,14 @@ class TestMlxAttentionPatching(unittest.TestCase):
         self.assertEqual(head_dim, 2)
         self.assertEqual(dtype, mx.float32)
 
+    def test_extract_logits_accepts_output_object(self):
+        logits = mx.zeros((1, 1, 4), dtype=mx.float32)
+
+        self.assertIs(
+            MlxModelRunner._extract_logits(SimpleNamespace(logits=logits)),
+            logits,
+        )
+
     def test_multimodal_forward_ids_are_clamped_with_input_embeds(self):
         runner = object.__new__(MlxModelRunner)
         runner.model = SimpleNamespace(
@@ -309,6 +321,33 @@ class TestMlxAttentionPatching(unittest.TestCase):
         self.assertEqual(input_embeds[0, 0].tolist(), [101.0, 102.0])
         self.assertEqual(input_embeds[0, 1].tolist(), [201.0, 202.0])
         self.assertEqual(mrope_positions.tolist(), [[1, 2], [5, 6], [9, 10]])
+
+    def test_multimodal_input_embeds_use_embedding_output_dtype(self):
+        runner = object.__new__(MlxModelRunner)
+        runner.enable_multimodal = True
+        runner.model = SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=FakePackedWeightEmbedding(16, 2))
+        )
+        mm_item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            offsets=[(0, 1)],
+            precomputed_embeddings=mx.array(
+                [[101.0, 102.0], [201.0, 202.0]], dtype=mx.float32
+            ),
+        )
+        mm_inputs = MultimodalInputs(mm_items=[mm_item])
+
+        input_embeds, _ = MlxModelRunner._build_multimodal_input_embeds(
+            runner,
+            token_ids=[5, 6],
+            mm_inputs=mm_inputs,
+            prefix_len=0,
+        )
+        mx.eval(input_embeds)
+
+        self.assertEqual(input_embeds.dtype, mx.bfloat16)
+        self.assertEqual(input_embeds[0, 0].tolist(), [101.0, 102.0])
+        self.assertEqual(input_embeds[0, 1].tolist(), [201.0, 202.0])
 
     def test_attn_config_rejects_heterogeneous_kv_shapes(self):
         runner = object.__new__(MlxModelRunner)
@@ -1355,6 +1394,15 @@ if _HAS_MLX:
 
         def __call__(self, input_ids):
             return self.weight[input_ids]
+
+    class FakePackedWeightEmbedding(nn.Module):
+        def __init__(self, vocab_size: int, hidden_size: int):
+            super().__init__()
+            self.weight = mx.zeros((vocab_size, hidden_size), dtype=mx.uint32)
+            self.hidden_size = hidden_size
+
+        def __call__(self, input_ids):
+            return mx.zeros((*input_ids.shape, self.hidden_size), dtype=mx.bfloat16)
 
     class FakeAttention(nn.Module):
         def __init__(self, use_aliases: bool = False):

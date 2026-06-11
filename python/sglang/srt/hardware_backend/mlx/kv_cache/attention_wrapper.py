@@ -128,6 +128,16 @@ class MLXAttentionWrapper(nn.Module):
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "_layer_idx", layer_idx)
 
+    def __getattr__(self, key: str):
+        try:
+            return super().__getattr__(key)
+        except AttributeError as exc:
+            try:
+                inner = object.__getattribute__(self, "_inner")
+            except AttributeError:
+                raise exc
+            return getattr(inner, key)
+
     def __call__(
         self,
         x: mx.array,

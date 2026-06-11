@@ -200,6 +200,9 @@ class MlxModelRunner:
     @staticmethod
     def _extract_logits(model_output):
         """Extract logits from model output, handling both tuple and direct returns."""
+        logits = getattr(model_output, "logits", None)
+        if logits is not None:
+            return logits
         if isinstance(model_output, tuple):
             return model_output[0]
         return model_output
@@ -584,9 +587,7 @@ class MlxModelRunner:
 
     def _encode_mm_item(self, item: MultimodalDataItem) -> mx.array:
         if item.precomputed_embeddings is not None:
-            return self._to_mx_array(
-                item.precomputed_embeddings, dtype=self._embed_tokens().weight.dtype
-            )
+            return self._to_mx_array(item.precomputed_embeddings)
         if item.feature is None:
             raise RuntimeError(f"Multimodal {item.modality.name} item has no feature.")
 
@@ -612,7 +613,7 @@ class MlxModelRunner:
 
         output = self.vl_model.vision_tower(pixel_values, grid_thw)
         embeds = output[0] if isinstance(output, tuple) else output
-        return embeds.astype(self._embed_tokens().weight.dtype)
+        return embeds
 
     def _build_multimodal_input_embeds(
         self,
@@ -642,6 +643,8 @@ class MlxModelRunner:
                 continue
 
             item_embeds = self._encode_mm_item(item)
+            if item_embeds.dtype != input_embeds.dtype:
+                item_embeds = item_embeds.astype(input_embeds.dtype)
             expected_len = self._item_token_len(item)
             if int(item_embeds.shape[0]) != expected_len:
                 raise RuntimeError(

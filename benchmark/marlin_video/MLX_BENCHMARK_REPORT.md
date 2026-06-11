@@ -4,10 +4,66 @@ Benchmark report, 2026-06-11.
 
 > Implementation note: this report captures the pre-fix behavior that motivated
 > the MLX multimodal work. The current branch adds an experimental
-> Marlin/Qwen3.5 MLX multimodal path that must be re-benchmarked on Apple
-> Silicon with `--disable-radix-cache --disable-overlap-schedule`.
+> Marlin/Qwen3.5 MLX multimodal path. The latest branch smoke result is below;
+> older measurements remain as historical context.
 
-## Current branch smoke result (2026-06-11)
+## Latest branch smoke result (2026-06-11)
+
+Branch tested: `marlin-mlx-mm-support` after pulling
+`origin/codex/marlin-mlx-mm-support` at `0ff270639d` plus the follow-up fixes
+in this change.
+
+The README accuracy smoke command was run through the existing venv interpreter
+with the documented split between the MLX weights and the HF processor:
+
+- Model path: `junwatu/Marlin-2B-MLX-8bit`
+- Tokenizer/processor path: `NemoStation/Marlin-2B`
+- Required server switches:
+  `--enable-multimodal --disable-radix-cache --disable-overlap-schedule`
+- Video: `jobs_presenting_ipod.mp4`
+
+Result: **pass**. The server returned HTTP 200, generated 256 completion
+tokens, and produced a semantically grounded caption:
+
+> "A man in a black t-shirt and dark jeans stands on a stage, presenting a
+> product... a silver iPod Nano... high-tech product demonstration..."
+
+Measured on the single smoke run:
+
+| Metric | Value |
+|---|---:|
+| Elapsed | 15.15 s |
+| Prompt tokens | 3237 |
+| Completion tokens | 256 |
+| Completion tokens/s | 16.90 |
+| Total tokens/s | 230.58 |
+
+Root cause of the previous HTTP-200 hallucination: the video path was active,
+but the generated vision embeddings were cast to
+`embed_tokens.weight.dtype` before being spliced into `inputs_embeds`. For the
+pre-quantized 8-bit MLX checkpoint, that weight dtype is packed storage
+(`uint32`), while the actual embedding output dtype is `bfloat16`. Casting the
+vision embeddings to `uint32` destroyed the visual signal without causing a
+shape or server error, so the model generated from effectively bad image/video
+features.
+
+The fix is to keep encoded multimodal embeddings in their natural dtype and
+cast them only at the splice point to the actual `input_embeds.dtype`. Two
+request-level blockers were also fixed while rerunning the smoke:
+
+- `MLXAttentionWrapper` now delegates missing attributes such as `rotary_emb`
+  to the wrapped attention module, matching `mlx_vlm` Qwen3.5 expectations.
+- `MlxModelRunner._extract_logits()` now accepts model outputs with a `.logits`
+  attribute, not only tuples or raw arrays.
+
+Validation:
+
+- Focused MLX unit tests for rotary delegation, logits extraction, multimodal
+  splicing, and packed-weight dtype handling passed locally.
+- The README SGLang MLX accuracy smoke passed semantically on the bundled
+  Jobs/iPod video.
+
+## Earlier branch smoke result before follow-up fixes (2026-06-11)
 
 Branch tested: `marlin-mlx-mm-support` at `5e14f1d021` (`Use MLX
 slice_update for multimodal embeddings`).
@@ -96,12 +152,12 @@ module is named `rotary_emb`, not `rope`. SGLang's MLX attention contract
 requires `("q_proj", "k_proj", "v_proj", "o_proj", "rope", "scale")`, so
 `find_attention_layers()` finds no supported attention layer and aborts.
 
-Conclusion: on this stack, the current branch does not yet pass the accuracy
-smoke test. There is still no valid throughput comparison to collect. The next
-fix should first make processor loading work for the MLX checkpoint or document
-`--tokenizer-path NemoStation/Marlin-2B` as the intended route, then adapt the
-MLX attention discovery/wrapper to `mlx_vlm`'s Qwen3.5 API without breaking
-multimodal RoPE semantics.
+Conclusion at that point: on this stack, the branch did not yet pass the
+accuracy smoke test. There was still no valid throughput comparison to collect.
+The next fix needed to make processor loading work for the MLX checkpoint or
+document `--tokenizer-path NemoStation/Marlin-2B` as the intended route, then
+adapt the MLX attention discovery/wrapper to `mlx_vlm`'s Qwen3.5 API without
+breaking multimodal RoPE semantics.
 
 Follow-up fix on this branch:
 
