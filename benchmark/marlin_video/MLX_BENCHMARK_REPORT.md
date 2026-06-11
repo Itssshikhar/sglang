@@ -7,6 +7,102 @@ Benchmark report, 2026-06-11.
 > Marlin/Qwen3.5 MLX multimodal path that must be re-benchmarked on Apple
 > Silicon with `--disable-radix-cache --disable-overlap-schedule`.
 
+## Current branch smoke result (2026-06-11)
+
+Branch tested: `marlin-mlx-mm-support` at `5e14f1d021` (`Use MLX
+slice_update for multimodal embeddings`).
+
+Environment:
+
+- Apple Silicon macOS (`arm64`) with Xcode/Metal tooling available.
+- Existing `sglang-metal` venv, Python 3.12.11.
+- `sglang` loaded from this checkout (`0.0.0.dev1+g73d0989d9.d20260610`).
+- `transformers` 5.11.0, `mlx_vlm` 0.6.3.
+- HF auth active with access to `NemoStation/Marlin-2B` and
+  `junwatu/Marlin-2B-MLX-8bit`.
+
+The README accuracy smoke command was run exactly, except through the existing
+venv interpreter because this shell has no global `python` on `PATH`:
+
+```bash
+sglang-metal/bin/python benchmark/marlin_video/bench_mlx_compare.py \
+  --mode sglang-mlx \
+  --sglang-model-path junwatu/Marlin-2B-MLX-8bit \
+  --sglang-extra-arg="--json-model-override-args '{\"architectures\":[\"Qwen3_5ForConditionalGeneration\"]}'" \
+  --sglang-extra-arg=--disable-radix-cache \
+  --disable-overlap-schedule \
+  --video-url https://github.com/sgl-project/sgl-test-files/raw/refs/heads/main/videos/jobs_presenting_ipod.mp4 \
+  --prompt "Describe the video. Include visible people, objects, scene layout, and any time-ranged events." \
+  --max-tokens 256 \
+  --warmup 0 \
+  --runs 1 \
+  --output benchmark/marlin_video/accuracy_smoke_sglang_mlx.jsonl
+```
+
+Result: the SGLang server failed during processor initialization before
+readiness, so no request was sent and no
+`benchmark/marlin_video/accuracy_smoke_sglang_mlx.jsonl` file was written.
+
+Primary startup failure:
+
+```text
+ValueError: Unrecognized image processor in junwatu/Marlin-2B-MLX-8bit.
+Should have a `image_processor_type` key in its preprocessor_config.json of
+config.json...
+```
+
+This is reproducible outside SGLang:
+
+- `AutoProcessor.from_pretrained("junwatu/Marlin-2B-MLX-8bit",
+  trust_remote_code=True)` fails with the same error.
+- `AutoProcessor.from_pretrained("NemoStation/Marlin-2B",
+  trust_remote_code=True)` succeeds and returns `Qwen3VLProcessor`.
+
+SGLang's processor fallback currently catches `"Unrecognized feature
+extractor"` in `python/sglang/srt/utils/hf_transformers/processor.py`, but not
+this `"Unrecognized image processor"` path.
+
+A non-invasive workaround was also tried:
+
+```bash
+sglang-metal/bin/python benchmark/marlin_video/bench_mlx_compare.py \
+  --mode sglang-mlx \
+  --sglang-model-path junwatu/Marlin-2B-MLX-8bit \
+  --sglang-extra-arg="--tokenizer-path NemoStation/Marlin-2B" \
+  --sglang-extra-arg="--json-model-override-args '{\"architectures\":[\"Qwen3_5ForConditionalGeneration\"]}'" \
+  --sglang-extra-arg=--disable-radix-cache \
+  --disable-overlap-schedule \
+  --video-url https://github.com/sgl-project/sgl-test-files/raw/refs/heads/main/videos/jobs_presenting_ipod.mp4 \
+  --prompt "Describe the video. Include visible people, objects, scene layout, and any time-ranged events." \
+  --max-tokens 256 \
+  --warmup 0 \
+  --runs 1 \
+  --output benchmark/marlin_video/accuracy_smoke_sglang_mlx.jsonl
+```
+
+That gets past processor loading and loads the MLX model, but then fails while
+patching the MLX KV-cache attention path:
+
+```text
+ValueError: No attention attribute in layer type
+<class 'mlx_vlm.models.qwen3_5.language.Qwen3_5DecoderLayer'>
+```
+
+Root cause observed locally: `mlx_vlm` 0.6.3 uses Qwen3.5 decoder layers with
+`linear_attn` for most layers and `self_attn` for full-attention layers. The
+full-attention module exposes `q_proj`, `k_proj`, `v_proj`, `o_proj`,
+`scale`, `num_attention_heads`, and `num_key_value_heads`, but its rotary
+module is named `rotary_emb`, not `rope`. SGLang's MLX attention contract
+requires `("q_proj", "k_proj", "v_proj", "o_proj", "rope", "scale")`, so
+`find_attention_layers()` finds no supported attention layer and aborts.
+
+Conclusion: on this stack, the current branch does not yet pass the accuracy
+smoke test. There is still no valid throughput comparison to collect. The next
+fix should first make processor loading work for the MLX checkpoint or document
+`--tokenizer-path NemoStation/Marlin-2B` as the intended route, then adapt the
+MLX attention discovery/wrapper to `mlx_vlm`'s Qwen3.5 API without breaking
+multimodal RoPE semantics.
+
 ## TL;DR
 
 | | SGLang MLX server | Custom MLX hybrid |

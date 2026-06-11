@@ -2,9 +2,10 @@
 
 > **Errata (2026-06-11):** see [MLX_BENCHMARK_REPORT.md](MLX_BENCHMARK_REPORT.md)
 > for the pre-fix benchmark results and bring-up notes. This branch now includes
-> an experimental Marlin/Qwen3.5 MLX multimodal path; rerun the benchmark on
-> Apple Silicon to validate that SGLang captions the video instead of producing
-> the historical text-only hallucination.
+> an experimental Marlin/Qwen3.5 MLX multimodal path, but the accuracy smoke
+> test currently does not reach generation on the tested Apple Silicon stack.
+> The current branch result and blockers are documented in the report before
+> the historical benchmark notes.
 
 This benchmark compares two Apple Silicon paths for Marlin video captioning:
 
@@ -114,6 +115,16 @@ Useful SGLang MLX switches:
 
 Run this before collecting throughput numbers. The first pass should answer one
 question only: does the SGLang MLX caption describe the actual video?
+
+Current status on this branch, tested 2026-06-11: this command fails during
+server startup before any request is sent. `AutoProcessor` rejects
+`junwatu/Marlin-2B-MLX-8bit` with an "Unrecognized image processor" error. A
+workaround that passes `--tokenizer-path NemoStation/Marlin-2B` gets past
+processor loading and loads the MLX model, but then fails while patching the
+MLX KV-cache attention path because the installed `mlx_vlm` Qwen3.5 attention
+module exposes `rotary_emb`, while SGLang's MLX attention wrapper expects a
+`rope` attribute. Do not collect throughput numbers until this smoke test
+actually produces a semantically grounded caption.
 
 ```bash
 python benchmark/marlin_video/bench_mlx_compare.py \
